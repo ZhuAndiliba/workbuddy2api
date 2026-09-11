@@ -1,6 +1,7 @@
 // payload.go 改写发往上游的 chat 请求体：
 //  1. 强制 stream:true（上游拒绝非流式）
 //  2. tool_choice 归一化（上游该字段是 string，对象形式会 400 code=11101）
+//  3. 国际站要求首条消息必须是 system，缺失时补一条空 system
 package upstream
 
 import (
@@ -17,7 +18,13 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
+// requireSystemFirst 为 true（国际站）时，首条非 system 会在最前面补一条空 system。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
+	return PrepareBodyOptFull(src, sanitize, efforts, false)
+}
+
+// PrepareBodyOptFull 全参数版本：requireSystemFirst 控制是否补齐首条 system（见 ensureSystemFirst）。
+func PrepareBodyOptFull(src []byte, sanitize bool, efforts map[string][]string, requireSystemFirst bool) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -29,6 +36,9 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
 	normalizeReasoningEffort(obj, efforts)
+	if requireSystemFirst {
+		ensureSystemFirst(obj)
+	}
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
@@ -39,6 +49,32 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 		return src
 	}
 	return out
+}
+
+// ensureSystemFirst 在国际站（要求首条必须是 system）上补齐一条空 system 消息。
+//
+// 背景：国际站对 messages 首条做硬校验，非 system 直接返回业务错误
+// code=11128 "first message is not system prompt"（HTTP 200，见 Classify 注释）。
+// 该错误被归为 ErrClient（不冷却、只换号），表现为"换号重试 N 次后 503"，
+// 排查成本高，故在网关侧直接补齐。
+//
+// 用空 content 而非注入任何提示词：实测空 system 同样被接受，且不改变用户请求语义
+// （不替用户添加指令）。仅当 messages 非空且首条不是 system 时才补；首条已是 system、
+// messages 缺失/为空、或元素非法时一律不动，避免给上游制造新问题。
+// 注意 normalizeRoles 已把 developer 归一为 system，故此处只看 "system"。
+func ensureSystemFirst(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return
+	}
+	first, ok := msgs[0].(map[string]any)
+	if !ok {
+		return
+	}
+	if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
+		return
+	}
+	obj["messages"] = append([]any{map[string]any{"role": "system", "content": ""}}, msgs...)
 }
 
 // effortRank 档位从低到高。

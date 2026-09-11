@@ -145,3 +145,74 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 		})
 	}
 }
+
+// TestEnsureSystemFirstGlobalOnly 国际站要求首条必须是 system（否则 code=11128），
+// 网关侧补齐：首条非 system 时在最前面插入一条空 system。
+func TestEnsureSystemFirstGlobalOnly(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		wantFirst   string // 补齐后首条 role；"" 表示期望不加（保持原样）
+		wantCount   int    // 补齐后消息数
+		wantContent string // 插入的 system content
+	}{
+		{"user 首条 → 补空 system", `{"model":"m","messages":[{"role":"user","content":"hi"}]}`, "system", 2, ""},
+		{"assistant 首条 → 补", `{"model":"m","messages":[{"role":"assistant","content":"hi"}]}`, "system", 2, ""},
+		{"tool 首条 → 补", `{"model":"m","messages":[{"role":"tool","content":"r"}]}`, "system", 2, ""},
+		{"已是 system → 不动", `{"model":"m","messages":[{"role":"system","content":"S"},{"role":"user","content":"hi"}]}`, "system", 2, "S"},
+		{"SYSTEM 大小写 → 视为已满足", `{"model":"m","messages":[{"role":"SYSTEM","content":"S"}]}`, "SYSTEM", 1, "S"},
+		{"developer 已被归一为 system → 不重复补", `{"model":"m","messages":[{"role":"developer","content":"D"}]}`, "system", 1, "D"},
+		{"messages 空数组 → 不动", `{"model":"m","messages":[]}`, "", 0, ""},
+		{"无 messages 字段 → 不动", `{"model":"m"}`, "", 0, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := PrepareBodyOptFull([]byte(c.body), false, nil, true)
+			var obj map[string]any
+			if err := json.Unmarshal(out, &obj); err != nil {
+				t.Fatalf("unmarshal: %v (%s)", err, out)
+			}
+			msgs, _ := obj["messages"].([]any)
+			if c.wantFirst == "" {
+				if len(msgs) != c.wantCount {
+					t.Fatalf("messages=%d want %d (should not modify): %s", len(msgs), c.wantCount, out)
+				}
+				return
+			}
+			if len(msgs) != c.wantCount {
+				t.Fatalf("messages=%d want %d: %s", len(msgs), c.wantCount, out)
+			}
+			first, _ := msgs[0].(map[string]any)
+			if got, _ := first["role"].(string); got != c.wantFirst {
+				t.Errorf("first role=%q want %q: %s", got, c.wantFirst, out)
+			}
+			if got, _ := first["content"].(string); got != c.wantContent {
+				t.Errorf("first content=%q want %q: %s", got, c.wantContent, out)
+			}
+			// 原始消息必须原样保留在后面（不得丢内容）。
+			if c.wantCount > 1 {
+				if last, _ := msgs[c.wantCount-1].(map[string]any); last == nil {
+					t.Errorf("original messages lost: %s", out)
+				}
+			}
+		})
+	}
+}
+
+// TestEnsureSystemFirstDisabled 非国际站（requireSystemFirst=false）不得改动消息序列。
+func TestEnsureSystemFirstDisabled(t *testing.T) {
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	out := PrepareBodyOptFull([]byte(body), false, nil, false)
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := obj["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("messages=%d want 1 (CN must not inject system): %s", len(msgs), out)
+	}
+	first, _ := msgs[0].(map[string]any)
+	if got, _ := first["role"].(string); got != "user" {
+		t.Errorf("first role=%q want user", got)
+	}
+}
