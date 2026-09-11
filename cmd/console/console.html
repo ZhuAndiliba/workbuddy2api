@@ -276,10 +276,12 @@ function renderModels(instances) {
 
 function render(st) {
   lastState = st;
+  const instances = st.instances || [];
+  syncLogTargets(instances);
   renderTotals(st.totals || {});
-  $('cards').innerHTML = st.instances.map(instanceCard).join('');
-  renderAccounts(st.instances);
-  renderModels(st.instances);
+  $('cards').innerHTML = instances.map(instanceCard).join('');
+  renderAccounts(instances);
+  renderModels(instances);
   $('conn').className = 'badge ok';
   $('conn').textContent = '已连接';
   $('sub').textContent = `运行中 ${(st.totals || {}).running || 0} / ${(st.totals || {}).instances || 0} 个实例 · `
@@ -330,8 +332,21 @@ async function doAction(target, action, card, uid) {
 
 // ── 日志卡片：常驻展示某个实例的日志尾部，可切换实例 / 行数 / 跟随。
 // 只更新 <pre> 文本，不重建整块 DOM，避免每 3 秒把滚动位置和选择状态冲掉。
-// 初始实例可用 ?log=global 指定（便于收藏/直达），非法值回落 cn。
-const LOG_TARGETS = [{ name: 'cn', label: 'CN' }, { name: 'global', label: '国际站' }];
+// 初始实例可用 ?log=global 指定（便于收藏/直达）；实际清单由 render() 按服务端
+// 返回的实例刷新——实例名来自 config，这里不写死。
+let LOG_TARGETS = [{ name: 'cn', label: 'CN' }, { name: 'global', label: '国际站' }];
+
+// syncLogTargets 用服务端实例清单更新日志卡片可选的实例：
+// 加/删实例自动跟进；当前选中项没了就落到第一个。
+function syncLogTargets(instances) {
+  const next = instances.map(v => ({ name: v.name, label: v.label }));
+  if (!next.length) return;
+  const changed = next.length !== LOG_TARGETS.length
+    || next.some((t, i) => t.name !== LOG_TARGETS[i].name || t.label !== LOG_TARGETS[i].label);
+  LOG_TARGETS = next;
+  if (!LOG_TARGETS.some(t => t.name === logTarget)) logTarget = LOG_TARGETS[0].name;
+  if (changed) renderLogTabs();
+}
 
 function initialLogTarget() {
   const q = new URLSearchParams(location.search).get('log');

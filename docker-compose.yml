@@ -1,12 +1,16 @@
-# docker-compose.yml — 一个容器内跑 CN + 国际站两个实例 + 控制台。
+# docker-compose.yml — 一个容器内跑 config 里声明的全部实例 + 控制台。
 #
 # 首次使用：
-#   cp config.example.json config.cn.json      # 改 "region": "cn"，api_key 换成强随机串
-#   cp config.example.json config.global.json  # 改 "region": "global"，注意 listen 用 :7865
-#   ./login.sh cn  /  ./login.sh global        # 生成 auths/*.json
+#   cp config.example.json config.json    # 改 api_key 换成强随机串
+#   ./login.sh cn  /  ./login.sh global   # 生成 auths/*.json
 #   docker compose up -d --build
 #
-# 只跑一个区：删掉（或不创建）对应 config，entrypoint 会只启存在的那个。
+# 容器部署的两处调整（都在 config.json 里）：
+#   1. "console": { "listen": "0.0.0.0:7860", "token": "<强随机串>" }
+#      —— 容器内监听回环则容器外访问不到；非回环监听时控制台强制要求 token。
+#   2. 每个实例的 listen 保持 ":7864" / ":7865"（默认值即可）。
+#
+# 只跑一个区：删掉 config 的 instances 里不要的那个实例，entrypoint 只启存在的。
 
 services:
   wb2api:
@@ -17,9 +21,10 @@ services:
     # 时区决定签到/保活的触发时刻，按需改
     environment:
       - TZ=Asia/Shanghai
-      # 控制台令牌：容器内控制台监听 0.0.0.0，务必设置（否则可被同网段访问并启停进程）
-      # 访问时用 http://<host>:7860/?token=<这里的值>
-      - WB2A_CONSOLE_TOKEN=${WB2A_CONSOLE_TOKEN:-}
+      # 通常不需要下面两个：控制台的监听与 token 直接写在 config.json 的 console 段。
+      # 只在临时调试（不想改配置）时才取消注释覆盖。
+      # - WB2A_CONSOLE_LISTEN=0.0.0.0:7860
+      # - WB2A_CONSOLE_TOKEN=override-me
     ports:
       # 只给本机访问就把左边改成 127.0.0.1:xxxx
       - "7864:7864"   # CN 实例
@@ -30,7 +35,6 @@ services:
       - ./auths:/app/auths
       # 池状态：读写（持久化冷却/积分/计数）
       - ./data:/app/data
-      # 两个实例的配置：只读挂载
-      - ./config.cn.json:/app/config.cn.json:ro
-      - ./config.global.json:/app/config.global.json:ro
+      # 配置：一份文件管全部实例，只读挂载
+      - ./config.json:/app/config.json:ro
     # 容器内已有 HEALTHCHECK（见 Dockerfile）；如需覆盖可在此加 healthcheck

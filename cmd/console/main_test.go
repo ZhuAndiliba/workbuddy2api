@@ -224,3 +224,58 @@ func TestReachableAccepts503(t *testing.T) {
 		t.Error("503 must count as reachable (process is alive)")
 	}
 }
+
+// TestInstanceNamesFromConfig 受管实例清单可从 config 的 instances 分节推导（排序）。
+func TestInstanceNamesFromConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	os.WriteFile(cfg, []byte(`{"listen":":7864","instances":{
+		"global":{"listen":":7865"},
+		"cn":{"listen":":7864"}
+	}}`), 0o600)
+	got, ok := instanceNames(cfg)
+	if !ok {
+		t.Fatal("ok=false for a readable config")
+	}
+	if len(got) != 2 || got[0] != "cn" || got[1] != "global" {
+		t.Errorf("instanceNames=%v want [cn global]", got)
+	}
+}
+
+// TestInstanceNamesLegacyConfig 单实例格式（无 instances 分节）：ok=true 但没有名字，
+// 调用方据此只挂一个实例（而不是摆出两个指向同一进程的卡片）。
+func TestInstanceNamesLegacyConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	os.WriteFile(cfg, []byte(`{"listen":":7864"}`), 0o600)
+	got, ok := instanceNames(cfg)
+	if !ok {
+		t.Error("ok=false for a readable single-instance config")
+	}
+	if len(got) != 0 {
+		t.Errorf("instanceNames=%v want empty for single-instance config", got)
+	}
+
+	// 配置读不出来：ok=false，调用方才回落到内置默认实例名。
+	if _, ok := instanceNames(filepath.Join(dir, "nope.json")); ok {
+		t.Error("ok=true for a missing config")
+	}
+	bad := filepath.Join(dir, "bad.json")
+	os.WriteFile(bad, []byte(`{not json`), 0o600)
+	if _, ok := instanceNames(bad); ok {
+		t.Error("ok=true for an unparsable config")
+	}
+}
+
+// TestLabelOf 展示名映射：已知实例给中文名，其余用实例名本身。
+func TestLabelOf(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"cn", "CN"},
+		{"global", "国际站"},
+		{"edge", "edge"},
+	} {
+		if got := labelOf(tc.in); got != tc.want {
+			t.Errorf("labelOf(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}

@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -30,14 +31,37 @@ func regionLabel(region string) string {
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
+	instance := flag.String("instance", "", "多实例配置下要运行的实例名（见 config 的 instances 分节）")
+	listInstances := flag.Bool("list-instances", false, "只打印 config 里的实例名（每行一个）后退出；供脚本/容器入口枚举")
+	printListen := flag.Bool("print-listen", false, "只打印本次实例生效的监听地址后退出；供脚本读配置")
 	flag.Parse()
 
-	cfg, err := Load(*cfgPath)
+	// 枚举模式：只读配置、不启服务，让 shell 侧不必自己解析 JSON。
+	if *listInstances {
+		names, err := InstanceNames(*cfgPath)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		for _, n := range names {
+			fmt.Println(n)
+		}
+		return
+	}
+	if *printListen {
+		c, err := LoadForInstance(*cfgPath, *instance)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		fmt.Println(c.Listen)
+		return
+	}
+
+	cfg, err := LoadForInstance(*cfgPath, *instance)
 	if err != nil {
 		// 配置文件不存在时给一次机会用纯默认 + env
 		if os.IsNotExist(err) {
 			log.Printf("config %s not found, using defaults+env", *cfgPath)
-			cfg, err = Load("")
+			cfg, err = LoadForInstance("", *instance)
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
@@ -153,7 +177,13 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v, region=%s)", cfg.Listen, cfg.APIKey != "", regionLabel(cfg.Region))
+	// 启动日志带上实例名（多实例格式下便于从 docker logs 区分是哪一份配置）。
+	if cfg.InstanceName != "" {
+		log.Printf("workbuddy2api listening on %s (instance=%s, api_key=%v, region=%s)",
+			cfg.Listen, cfg.InstanceName, cfg.APIKey != "", regionLabel(cfg.Region))
+	} else {
+		log.Printf("workbuddy2api listening on %s (api_key=%v, region=%s)", cfg.Listen, cfg.APIKey != "", regionLabel(cfg.Region))
+	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}

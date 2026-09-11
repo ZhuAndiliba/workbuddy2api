@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,27 @@ import (
 )
 
 // Config 顶层配置。
+//
+// 支持两种文件格式（自动识别，无需声明）：
+//
+//  1. **多实例格式**（推荐）：一份 config.json 描述全部实例，共享段 + instances 分节。
+//     启动时用 -instance <name> 指定要跑哪个：
+//
+//     {
+//     "api_key": "sk-...",                  // 共享：未在实例里覆盖的字段都继承这里
+//     "auth_dir": "./auths",
+//     "console": { "listen": "127.0.0.1:7860", "token": "..." },
+//     "instances": {
+//     "cn":     { "region": "cn",     "listen": ":7864", "state_file": "./data/state.cn.json" },
+//     "global": { "region": "global", "listen": ":7865", "state_file": "./data/state.global.json" }
+//     }
+//     }
+//
+//  2. **单实例格式**（旧，仍兼容）：顶层直接写 listen/region/...，不带 instances。
+//     此时 -instance 可省略（给了也只会校验名字存在与否）。
+//
+// 合并规则：先取 Default() → 覆盖顶层共享字段 → 再用 instances[name] 覆盖 → env 覆盖。
+// 因此共享段写一次，各实例只写差异（通常就是 region / listen / state_file）。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
@@ -24,6 +46,21 @@ type Config struct {
 	// 权威依据是凭证的 domain（auth.Region()）；被滤掉的账号不会进池，
 	// 因此本实例只会向该区域的上游 host 发请求。
 	Region string `json:"region"`
+
+	// Console 控制台相关配置（由 cmd/console 读取；server 忽略）。
+	// 放进同一份 config 是为了"一个文件管全部"，省掉控制台单独传 -token。
+	Console struct {
+		// Listen 控制台监听地址。空 → cmd/console 用其默认（127.0.0.1:7860）。
+		Listen string `json:"listen"`
+		// Token 控制台访问令牌。空 = 不鉴权（仅在监听回环时允许）。
+		Token string `json:"token"`
+	} `json:"console"`
+
+	// Instances 多实例分节：key 为实例名（-instance 取值），value 为该实例的覆盖字段（原始 JSON）。
+	// 用 RawMessage 而非具体结构体，是为了让"实例覆盖"复用同一套字段解析——把该实例的
+	// JSON 再 Unmarshal 到已载入共享字段的 Config 上，天然实现"只覆盖出现过的字段"，
+	// 不必为每个字段维护指针类型。仅用于多实例格式；单实例格式下为空。
+	Instances map[string]json.RawMessage `json:"instances"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -86,6 +123,7 @@ type Config struct {
 	} `json:"session_sticky"`
 
 	// 解析后
+	InstanceName        string        `json:"-"` // 本次运行的实例名（多实例格式下由 -instance 决定）
 	SoftRateDur         time.Duration `json:"-"`
 	BreakerCooldownDur  time.Duration `json:"-"`
 	BreakerCooldownMaxD time.Duration `json:"-"`
@@ -121,23 +159,110 @@ func Default() *Config {
 	return c
 }
 
-// Load 从文件读，再用 WB2A_* env 覆盖。
+// Load 从文件读，再用 WB2A_* env 覆盖。instance 为空时按单实例格式处理。
 func Load(path string) (*Config, error) {
+	return LoadForInstance(path, "")
+}
+
+// LoadForInstance 载入配置并合并指定实例的覆盖字段。
+//
+// 合并顺序：Default() → 文件顶层（共享段）→ instances[instance] → 环境变量 → normalize。
+// instance 为空时要求文件是单实例格式（无 instances 分节）；若文件是多实例格式而没给
+// instance，直接报错并列出可选名字——避免"以为在跑某个实例、实际跑了个空壳"。
+func LoadForInstance(path, instance string) (*Config, error) {
 	c := Default()
+	var raw []byte
 	if path != "" {
-		raw, err := os.ReadFile(path)
+		b, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
+		raw = b
+		// 顶层：共享字段 + instances 分节（RawMessage 先存着，稍后再按名字解）
 		if err := json.Unmarshal(raw, c); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
+
+	if len(c.Instances) > 0 {
+		if instance == "" {
+			return nil, fmt.Errorf("配置含 %d 个实例 %v，必须用 -instance 指定要运行哪个",
+				len(c.Instances), instanceNames(c.Instances))
+		}
+		body, ok := c.Instances[instance]
+		if !ok {
+			return nil, fmt.Errorf("实例 %q 不在配置里（可选：%v）", instance, instanceNames(c.Instances))
+		}
+		// 把该实例的覆盖字段叠到已载入共享字段的 Config 上：
+		// 只覆盖 JSON 里出现过的键，其余继承共享段。
+		if err := json.Unmarshal(body, c); err != nil {
+			return nil, fmt.Errorf("parse instances.%s: %w", instance, err)
+		}
+		c.InstanceName = instance
+	} else if instance != "" {
+		// 单实例格式但显式指定了名字：不报错（便于脚本统一传参），只记下名字。
+		c.InstanceName = instance
+	}
+
+	// instances 分节本身不参与后续逻辑，清掉避免误用。
+	c.Instances = nil
+
 	applyEnv(c)
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
 	return c, nil
+}
+
+// instanceNames 返回排序后的实例名（报错信息用，保证输出稳定）。
+func instanceNames(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// InstanceBrief 脚本枚举用：实例名 + 生效监听地址。
+type InstanceBrief struct {
+	Name   string
+	Listen string
+}
+
+// ListInstances 返回各实例的生效监听地址（按名字排序），走完整合并逻辑
+// （共享段 + instances[name] + env 覆盖），因此与实例真正启动时用的地址一致。
+// 单实例格式（无 instances 分节）返回空列表。
+func ListInstances(path string) ([]InstanceBrief, error) {
+	names, err := InstanceNames(path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]InstanceBrief, 0, len(names))
+	for _, n := range names {
+		c, err := LoadForInstance(path, n)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, InstanceBrief{Name: n, Listen: c.Listen})
+	}
+	return out, nil
+}
+
+// InstanceNames 只读配置文件里的实例名（排序），供外部脚本/容器入口枚举要启动的实例。
+// 单实例格式（无 instances 分节）返回空列表——调用方据此走"不带 -instance"的路径。
+func InstanceNames(path string) ([]string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var probe struct {
+		Instances map[string]json.RawMessage `json:"instances"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	return instanceNames(probe.Instances), nil
 }
 
 func applyEnv(c *Config) {

@@ -12,7 +12,7 @@ data/
 /console
 
 # Config with secrets (use config.example.json)
-# config.cn.json / config.global.json 同样含 api_key，一并排除；示例文件保留。
+# config.json 含 api_key 与控制台 token；旧的单实例配置名一并排除，防止误提交。
 config.json
 config.cn.json
 config.global.json

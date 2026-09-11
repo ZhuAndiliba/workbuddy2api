@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -281,5 +282,201 @@ func TestRegionInvalidEnv(t *testing.T) {
 	t.Setenv("WB2A_REGION", "bogus")
 	if _, err := Load(""); err == nil {
 		t.Fatal("want error for invalid WB2A_REGION")
+	}
+}
+
+// --- 多实例（合并配置）格式 ---
+
+const multiInstanceCfg = `{
+  "api_key": "shared-key",
+  "auth_dir": "./auths",
+  "pool": {"max_in_flight": 7},
+  "instances": {
+    "cn": {
+      "region": "cn",
+      "listen": ":7864",
+      "state_file": "./data/state.cn.json"
+    },
+    "global": {
+      "region": "global",
+      "listen": ":7865",
+      "state_file": "./data/state.global.json",
+      "api_key": "global-key",
+      "pool": {"max_in_flight": 2}
+    }
+  }
+}`
+
+func writeCfg(t *testing.T, body string) string {
+	t.Helper()
+	fp := filepath.Join(t.TempDir(), "c.json")
+	if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fp
+}
+
+// TestInstanceInheritsShared 共享段字段被实例继承，实例只写差异。
+func TestInstanceInheritsShared(t *testing.T) {
+	fp := writeCfg(t, multiInstanceCfg)
+	c, err := LoadForInstance(fp, "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.InstanceName != "cn" {
+		t.Errorf("InstanceName=%q want cn", c.InstanceName)
+	}
+	if c.APIKey != "shared-key" {
+		t.Errorf("api_key=%q want shared-key (inherit)", c.APIKey)
+	}
+	if c.AuthDir != "./auths" {
+		t.Errorf("auth_dir=%q want ./auths (inherit)", c.AuthDir)
+	}
+	if c.Pool.MaxInFlight != 7 {
+		t.Errorf("max_in_flight=%d want 7 (inherit)", c.Pool.MaxInFlight)
+	}
+	if c.Region != "cn" || c.Listen != ":7864" || c.StateFile != "./data/state.cn.json" {
+		t.Errorf("instance fields=%q/%q/%q", c.Region, c.Listen, c.StateFile)
+	}
+}
+
+// TestInstanceOverrides 实例分节覆盖同名共享字段（含嵌套结构体里的字段）。
+func TestInstanceOverrides(t *testing.T) {
+	fp := writeCfg(t, multiInstanceCfg)
+	c, err := LoadForInstance(fp, "global")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.APIKey != "global-key" {
+		t.Errorf("api_key=%q want global-key (override)", c.APIKey)
+	}
+	if c.Pool.MaxInFlight != 2 {
+		t.Errorf("max_in_flight=%d want 2 (override)", c.Pool.MaxInFlight)
+	}
+	// 未覆盖的字段仍继承共享段。
+	if c.AuthDir != "./auths" {
+		t.Errorf("auth_dir=%q want ./auths (inherit)", c.AuthDir)
+	}
+	if c.Region != "global" || c.Listen != ":7865" {
+		t.Errorf("region=%q listen=%q", c.Region, c.Listen)
+	}
+}
+
+// TestInstancesClearedAfterLoad instances 分节不残留到运行期配置。
+func TestInstancesClearedAfterLoad(t *testing.T) {
+	fp := writeCfg(t, multiInstanceCfg)
+	c, err := LoadForInstance(fp, "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Instances != nil {
+		t.Errorf("Instances should be nil after load, got %d entries", len(c.Instances))
+	}
+}
+
+// TestMultiInstanceRequiresName 多实例配置不给 -instance 必须报错（而不是跑个空壳）。
+func TestMultiInstanceRequiresName(t *testing.T) {
+	fp := writeCfg(t, multiInstanceCfg)
+	_, err := LoadForInstance(fp, "")
+	if err == nil {
+		t.Fatal("want error when instances present but instance name missing")
+	}
+	for _, want := range []string{"cn", "global", "-instance"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should mention %q", err, want)
+		}
+	}
+}
+
+// TestUnknownInstance 名字写错时报错并列出可选实例。
+func TestUnknownInstance(t *testing.T) {
+	fp := writeCfg(t, multiInstanceCfg)
+	_, err := LoadForInstance(fp, "cnd")
+	if err == nil {
+		t.Fatal("want error for unknown instance")
+	}
+	if !strings.Contains(err.Error(), "cn") || !strings.Contains(err.Error(), "global") {
+		t.Errorf("error %q should list available instances", err)
+	}
+}
+
+// TestLegacySingleInstanceStillWorks 旧的单实例格式：不带 -instance 照常加载。
+func TestLegacySingleInstanceStillWorks(t *testing.T) {
+	fp := writeCfg(t, `{"listen":":9999","api_key":"k","region":"cn"}`)
+	c, err := LoadForInstance(fp, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen != ":9999" || c.APIKey != "k" || c.Region != "cn" {
+		t.Errorf("c=%+v", c)
+	}
+	if c.InstanceName != "" {
+		t.Errorf("InstanceName=%q want empty for legacy config", c.InstanceName)
+	}
+	// 显式传名字也不报错（脚本统一传参的场景），仅记下名字。
+	c2, err := LoadForInstance(fp, "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.InstanceName != "cn" || c2.Listen != ":9999" {
+		t.Errorf("c2=%+v", c2)
+	}
+}
+
+// TestInstanceEnvWins env 覆盖优先级最高（在实例覆盖之上）。
+func TestInstanceEnvWins(t *testing.T) {
+	t.Setenv("WB2A_LISTEN", ":1234")
+	fp := writeCfg(t, multiInstanceCfg)
+	c, err := LoadForInstance(fp, "cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen != ":1234" {
+		t.Errorf("listen=%q want env :1234", c.Listen)
+	}
+}
+
+// TestInstanceNames 实例名排序返回；单实例格式返回空。
+func TestInstanceNames(t *testing.T) {
+	fp := writeCfg(t, multiInstanceCfg)
+	names, err := InstanceNames(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 2 || names[0] != "cn" || names[1] != "global" {
+		t.Errorf("names=%v want [cn global]", names)
+	}
+
+	legacy := writeCfg(t, `{"listen":":7863"}`)
+	names, err = InstanceNames(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Errorf("legacy config should yield no names, got %v", names)
+	}
+}
+
+func TestInstanceNamesMissingFile(t *testing.T) {
+	if _, err := InstanceNames(filepath.Join(t.TempDir(), "nope.json")); err == nil {
+		t.Fatal("want error for missing config")
+	}
+}
+
+// TestListInstances 返回各实例的生效监听地址（走完整合并逻辑）。
+func TestListInstances(t *testing.T) {
+	fp := writeCfg(t, multiInstanceCfg)
+	out, err := ListInstances(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("out=%v want 2 instances", out)
+	}
+	if out[0].Name != "cn" || out[0].Listen != ":7864" {
+		t.Errorf("out[0]=%+v", out[0])
+	}
+	if out[1].Name != "global" || out[1].Listen != ":7865" {
+		t.Errorf("out[1]=%+v", out[1])
 	}
 }

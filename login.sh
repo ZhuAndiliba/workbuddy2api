@@ -9,10 +9,12 @@
 #   1. POST /v2/plugin/auth/state 拿授权 URL（无 PKCE，state 由服务端签发）
 #   2. 你在浏览器打开 URL 完成登录
 #   3. 回到这里按 y → poll 拿 token+uid+nickname → 签到 → 落盘 auths/workbuddy-<uid>.json
-#   4. 重启 workbuddy2api 容器加载新账号
+#   4. 重启该区域的实例（cn/global）以加载新账号
 #
 # 区域决定上游 host 与 Origin，两区凭证互不通用；落盘的 domain 字段决定
 # 网关侧 region 判定（workbuddy.ai → 国际站），无需改配置。
+# 第 4 步按 config.json 的 instances.cn / instances.global 找端口，故实例名
+# 请沿用 cn / global（自定义实例名时其他步骤照常，只是不会自动重启）。
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -158,15 +160,28 @@ chmod 600 "$AUTH_FILE" 2>/dev/null || true
 
 # ─── 让对应区域的本机实例重新加载账号 ──────────────────────
 # 只重启该区域的实例（login.sh global 不会打扰 CN 实例）。
+# 端口/api_key 从 config.json 读：实例分节里覆盖值优先，否则用共享段——
+# 与 cmd/server 的合并规则一致（见 config.go 的 LoadForInstance）。
 echo ""
-CFG="config.${REGION}.json"
+CFG="${WB2A_CONFIG:-config.json}"
 if [[ ! -f "$CFG" ]]; then
     echo "配置 $CFG 不存在，auth 文件已保存，启动时会自动加载"
-elif ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+elif ! command -v python3 >/dev/null 2>&1; then
     echo "缺 python3，无法读取端口；auth 文件已保存，实例重启后会自动加载"
 else
-    PORT=$(python3 -c "import json;print(json.load(open('$CFG')).get('listen',':7863').lstrip(':'))" 2>/dev/null || echo "")
-    API_KEY=$(python3 -c "import json;print(json.load(open('$CFG')).get('api_key',''))" 2>/dev/null || echo "")
+    read -r PORT API_KEY <<<"$(python3 - "$CFG" "$REGION" <<'PYEOF'
+import json, sys
+cfg, name = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(cfg))
+except Exception:
+    d = {}
+inst = (d.get("instances") or {}).get(name) or {}
+listen = inst.get("listen") or d.get("listen") or ":7863"
+key = inst.get("api_key") or d.get("api_key") or ""
+print(str(listen).rsplit(":", 1)[-1], key)
+PYEOF
+)"
     if [[ -n "$PORT" ]] && curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null; then
         echo "重启 ${LABEL} 实例（:${PORT}）以加载新账号..."
         ./run.sh "$REGION" restart -d >/dev/null 2>&1 || echo "  ! 重启失败，可手动执行 ./run.sh $REGION restart -d"

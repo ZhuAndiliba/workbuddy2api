@@ -26,15 +26,15 @@ RUN apk add --no-cache ca-certificates tzdata curl \
 
 WORKDIR /app
 COPY --from=build /out/ /app/
-COPY run.sh docker-entrypoint.sh /app/
+COPY docker-entrypoint.sh docker-healthcheck.sh /app/
 RUN chmod +x /app/wb2api /app/console /app/login /app/signin_bin /app/credit \
-              /app/run.sh /app/docker-entrypoint.sh
+              /app/docker-entrypoint.sh /app/docker-healthcheck.sh
 
 # 7864 CN · 7865 国际站 · 7860 控制台
 EXPOSE 7860 7864 7865
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-  CMD curl -fsS http://127.0.0.1:7864/healthz >/dev/null 2>&1 \
-   || curl -fsS http://127.0.0.1:7865/healthz >/dev/null 2>&1 || exit 1
+# 端口从 config 读，503（活着但无可用账号）不算不健康——判据见脚本注释。
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s \
+  CMD /app/docker-healthcheck.sh
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]

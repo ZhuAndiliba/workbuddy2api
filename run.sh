@@ -5,26 +5,28 @@
 # 区域由 config 的 "region" 字段决定，账号按凭证 domain 自动归入对应实例。
 #
 # 用法:
-#   ./run.sh                # 启动两个实例（后台，等价于 ./run.sh both -d）
+#   ./run.sh                # 启动全部实例（后台，等价于 ./run.sh both -d）
 #   ./run.sh cn             # 前台运行 CN 实例（:7864）
 #   ./run.sh global         # 前台运行国际站实例（:7865）
+#   ./run.sh <实例名> -d     # 配置里自定义的实例同样可直接当 target
 #   ./run.sh cn -d          # 后台运行（写 data/run/<target>.pid 与 data/logs/<target>.log）
-#   ./run.sh both -d        # 两个实例都后台运行（both 恒为后台，见下）
+#   ./run.sh both -d        # 全部实例都后台运行（多实例恒为后台，见下）
 #   ./run.sh cn restart     # 重启
 #   ./run.sh stop both      # 停止
-#   ./run.sh status         # 查看两个实例状态与端口健康
+#   ./run.sh status         # 查看实例状态与端口健康
 #   ./run.sh logs cn        # 跟踪日志（tail -f）
 #   ./run.sh build          # 仅编译（server 二进制）
-#   ./run.sh console -d     # 启动控制台 :7860（网页查看状态 + 点击启停两实例）
+#   ./run.sh console -d     # 启动控制台 :7860（网页查看状态 + 点击启停实例）
 #   ./run.sh console        # 控制台前台运行；console stop|restart|status|logs 同理
 #   ./run.sh login global   # OAuth 登录国际站账号（透传给 login.sh）
 #
-# 注：both 只能后台运行——前台模式下 start 用 exec 替换进程，第二个实例会永远起不来，
-# 故 both 自动强制 -d（并打印提示）。
+# 注：多实例只能后台运行——前台模式下 start 用 exec 替换进程，后面的实例永远起不来，
+# 故多个实例自动强制 -d（并打印提示）。
 #
-# 端口/配置对应关系（可在 config.<target>.json 里改）:
-#   cn     → :7864   config.cn.json     data/state.cn.json
-#   global → :7865   config.global.json data/state.global.json
+# 端口/配置对应关系（都在 config.json 的 instances 分节里改）:
+#   cn     → :7864   instances.cn.listen      data/state.cn.json
+#   global → :7865   instances.global.listen  data/state.global.json
+# 实例名不限于 cn/global：配置里加一个实例，`./run.sh <名字> -d` 就能起它。
 #
 # 编译：优先用本地 Go；没有 Go 则用已交叉编译好的 ./wb2api（Docker 产出）。
 set -euo pipefail
@@ -41,27 +43,34 @@ usage() {
     exit 1
 }
 
-# configFor / labelFor / portFor：单一映射来源，避免散落硬编码。
-configFor() {
-    case "$1" in
-        cn)     echo "config.cn.json" ;;
-        global) echo "config.global.json" ;;
-        *) echo "未知实例: $1（可选 cn | global）" >&2; return 1 ;;
-    esac
-}
+# CONFIG 单一配置文件，内含全部实例（见 config.json 的 instances 分节）。
+CONFIG="${WB2A_CONFIG:-config.json}"
 
+# labelFor：实例展示名。
 labelFor() {
     case "$1" in
         cn)     echo "CN" ;;
         global) echo "国际站" ;;
-        *) return 1 ;;
+        *) echo "$1" ;;
     esac
 }
 
-# portFor 从该实例的 config 里读 listen（去掉冒号），保证与配置始终一致。
+# 配置一律交给二进制自己解析（-print-listen / -list-instances）：走的是 server 同一套
+# 合并逻辑（共享段 + instances 覆盖 + env），脚本里不必再写一份 JSON 解析。
+# 二进制还没编出来时这些函数返回空，调用方需容忍"读不到"。
+
+# portFor 该实例生效的监听端口（读不到返回空串）。
 portFor() {
-    local cfg; cfg="$(configFor "$1")"
-    python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['listen'].lstrip(':'))" "$cfg" 2>/dev/null
+    [[ -x "$BIN" ]] || return 0
+    "$BIN" -config "$CONFIG" -instance "$1" -print-listen 2>/dev/null | sed 's/.*://'
+}
+
+# hasInstance 判断该实例名是否在 config 里（单实例格式恒定通过）。
+hasInstance() {
+    [[ -x "$BIN" ]] || return 0
+    local names; names="$("$BIN" -config "$CONFIG" -list-instances 2>/dev/null)" || return 0
+    [[ -z "$names" ]] && return 0 # 单实例格式：不带 instances 分节，不做限制
+    grep -qx -- "$1" <<<"$names"
 }
 
 pidFile() { echo "$RUN_DIR/$1.pid"; }
@@ -99,8 +108,7 @@ EOF
 
 start() {
     local target="$1" daemon="$2"
-    local cfg; cfg="$(configFor "$target")"
-    [[ -f "$cfg" ]] || { echo "缺少配置文件 $cfg" >&2; exit 1; }
+    [[ -f "$CONFIG" ]] || { echo "缺少配置文件 $CONFIG" >&2; exit 1; }
 
     if isRunning "$target"; then
         echo "[$target] 已在运行 (pid $(cat "$(pidFile "$target")"))，跳过启动"
@@ -108,17 +116,27 @@ start() {
     fi
 
     mkdir -p "$RUN_DIR" "$LOG_DIR"
+    # 先确保二进制可用：实例名与端口都靠它读配置（见文件头 portFor/hasInstance）。
+    build
+
+    if ! hasInstance "$target"; then
+        echo "[$target] 不在 $CONFIG 的 instances 分节里，跳过" >&2
+        return 1
+    fi
+
     local port; port="$(portFor "$target")"
-    if [[ -n "$port" ]] && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    if [[ -z "$port" ]]; then
+        echo "[$target] 读不到监听端口（$CONFIG 里该实例缺 listen？）" >&2
+        return 1
+    fi
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
         echo "[$target] 端口 $port 已被占用，先停掉占用者再启动" >&2
         exit 1
     fi
 
-    build
-
-    echo "==> 启动 $(labelFor "$target") 实例 (:$port, config=$cfg)"
+    echo "==> 启动 $(labelFor "$target") 实例 (:$port, instance=$target, config=$CONFIG)"
     if [[ "$daemon" == "-d" ]]; then
-        nohup "$BIN" -config "$cfg" >>"$(logFile "$target")" 2>&1 &
+        nohup "$BIN" -config "$CONFIG" -instance "$target" >>"$(logFile "$target")" 2>&1 &
         echo $! >"$(pidFile "$target")"
         sleep 1
         if isRunning "$target"; then
@@ -130,7 +148,7 @@ start() {
         fi
     else
         echo "(前台运行，Ctrl-C 退出)"
-        exec "$BIN" -config "$cfg"
+        exec "$BIN" -config "$CONFIG" -instance "$target"
     fi
 }
 
@@ -160,10 +178,15 @@ stop() {
 statusOne() {
     local target="$1"
     local port; port="$(portFor "$target")"
+    local portShow=":${port:-?}"
     if isRunning "$target"; then
-        printf "%-8s 运行中 (pid %s) :%s  " "$target" "$(cat "$(pidFile "$target")")" "$port"
+        printf "%-8s 运行中 (pid %s) %-7s " "$target" "$(cat "$(pidFile "$target")")" "$portShow"
     else
-        printf "%-8s 未运行            :%s  " "$target" "$port"
+        printf "%-8s 未运行            %-7s " "$target" "$portShow"
+    fi
+    if [[ -z "$port" ]]; then
+        echo "healthz=--- （读不到端口：先 ./run.sh build 编出 wb2api）"
+        return
     fi
     local code
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$port/healthz" 2>/dev/null || echo "---")"
@@ -173,16 +196,28 @@ statusOne() {
 status() {
     echo "实例      状态                  端口   健康检查"
     echo "------------------------------------------------------"
-    statusOne cn
-    statusOne global
+    # 实例清单来自配置，不写死 cn/global（读不到配置时退回这两个）。
+    local names=""
+    if [[ -x "$BIN" ]]; then
+        names="$("$BIN" -config "$CONFIG" -list-instances 2>/dev/null || true)"
+    fi
+    for t in ${names:-cn global}; do
+        statusOne "$t"
+    done
     echo
     echo "提示：healthz 503 = 无可用账号（该实例区域内没有 healthy 账号），并非进程挂了。"
 }
 
-# 展开 target：both → cn global
+# 展开 target：both/all → 配置里的全部实例（读不到配置时回落到 cn global）
+# 输出统一用空格分隔：调用方靠 "含空格" 判断"是否多实例"，换行分隔会漏判。
 expandTargets() {
     if [[ "$1" == "both" || "$1" == "all" ]]; then
-        echo "cn global"
+        local names=""
+        if [[ -x "$BIN" ]]; then
+            names="$("$BIN" -config "$CONFIG" -list-instances 2>/dev/null || true)"
+        fi
+        echo "${names:-cn global}" | tr '\n' ' '
+        echo
     else
         echo "$1"
     fi
@@ -207,7 +242,15 @@ if [[ "${1:-}" == "console" ]]; then
     CONSOLE_BIN="./console"
     CONSOLE_PID="$RUN_DIR/console.pid"
     CONSOLE_LOG="$LOG_DIR/console.log"
-    CONSOLE_PORT=7860
+
+    # 控制台端口同样问二进制（含 config 的 console 段与默认回落）；没编出来就先按默认。
+    console_port() {
+        local l=""
+        if [[ -x "$CONSOLE_BIN" ]]; then
+            l="$("$CONSOLE_BIN" -root "$(pwd)" -config "$CONFIG" -print-listen 2>/dev/null || true)"
+        fi
+        echo "${l##*:}"
+    }
 
     c_daemon=""; c_sub="start"
     for arg in "$@"; do
@@ -248,6 +291,7 @@ if [[ "${1:-}" == "console" ]]; then
     case "$c_sub" in
         stop) console_stop; exit 0 ;;
         status)
+            CONSOLE_PORT="$(console_port)"
             code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$CONSOLE_PORT/" 2>/dev/null || echo '---')"
             if console_running; then
                 printf "console  运行中 (pid %s) :%s  http=%s\n" "$(cat "$CONSOLE_PID")" "$CONSOLE_PORT" "$code"
@@ -266,61 +310,74 @@ if [[ "${1:-}" == "console" ]]; then
         echo "[console] 已在运行 (pid $(cat "$CONSOLE_PID"))，跳过启动"
     else
         mkdir -p "$RUN_DIR" "$LOG_DIR"
+        console_build
+        CONSOLE_PORT="$(console_port)"
         if lsof -nP -iTCP:"$CONSOLE_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
             echo "[console] 端口 $CONSOLE_PORT 已被占用" >&2; exit 1
         fi
-        console_build
         echo "==> 启动控制台 (:$CONSOLE_PORT)"
         if [[ "$c_daemon" == "-d" ]]; then
-            nohup "$CONSOLE_BIN" -root "$(pwd)" >>"$CONSOLE_LOG" 2>&1 &
+            nohup "$CONSOLE_BIN" -root "$(pwd)" -config "$CONFIG" >>"$CONSOLE_LOG" 2>&1 &
             echo $! >"$CONSOLE_PID"
             sleep 1
             if console_running; then
                 echo "[console] 已后台启动 (pid $(cat "$CONSOLE_PID"))"
-                echo "           打开 http://127.0.0.1:$CONSOLE_PORT/ 查看/启停两个实例"
+                echo "           打开 http://127.0.0.1:$CONSOLE_PORT/ 查看/启停实例（监听与 token 见 config 的 console 段）"
             else
                 echo "[console] 启动失败，日志尾部：" >&2; tail -20 "$CONSOLE_LOG" >&2; exit 1
             fi
         else
             echo "(前台运行，Ctrl-C 退出)"
-            exec "$CONSOLE_BIN" -root "$(pwd)"
+            exec "$CONSOLE_BIN" -root "$(pwd)" -config "$CONFIG"
         fi
     fi
     exit 0
 fi
 
-# 参数解析：子命令（start/stop/restart/status/logs）与目标（cn/global/both/all）
-# 顺序任意、都可缺省——"stop both" 与 "both stop" 等价，"stop" 缺省对 both 生效。
+# 参数解析：子命令（start/stop/restart/status/logs）与目标（实例名，或 both/all）
+# 顺序任意、都可缺省——"stop both" 与 "both stop" 等价，"stop" 缺省对全部实例生效。
 target=""
 sub=""
 daemon=""
+unknown=""
 for arg in "$@"; do
     case "$arg" in
         -d|--daemon) daemon="-d" ;;
         start|stop|restart|status|logs) sub="$arg" ;;
         cn|global|both|all) target="$arg" ;;
-        *) echo "未知参数: $arg" >&2; usage ;;
+        *) [[ -z "$unknown" ]] && unknown="$arg" ;;
     esac
 done
+# 不限于 cn/global：配置里自定义的实例名也能直接当 target（先编出 wbapi 才查得到名字）。
+if [[ -n "$unknown" ]]; then
+    if [[ -z "$target" && -x "$BIN" ]] && hasInstance "$unknown"; then
+        target="$unknown"
+    else
+        echo "未知参数: $unknown" >&2
+        usage
+    fi
+fi
 target="${target:-both}"
 sub="${sub:-start}"
 
-# status 且目标为两实例：用带表头的汇总视图（单实例仍走逐行输出）。
-if [[ "$sub" == "status" && "$(expandTargets "$target")" == *" "* ]]; then
+TARGETS="$(expandTargets "$target")"
+
+# status 且目标多于一个：用带表头的汇总视图（单实例仍走逐行输出）。
+if [[ "$sub" == "status" && "$TARGETS" == *" "* ]]; then
     status
     exit 0
 fi
 
-# both 恒后台：前台模式下 start 走 exec 替换进程，第二个实例永远起不来。
+# 多实例恒后台：前台模式下 start 走 exec 替换进程，后面的实例永远起不来。
 # start 与 restart 都适用（restart 内部也要 start 一次）。
 forced_daemon=""
-if [[ "$(expandTargets "$target")" == *" "* && ( "$sub" == "start" || "$sub" == "restart" ) && "$daemon" != "-d" ]]; then
+if [[ "$TARGETS" == *" "* && ( "$sub" == "start" || "$sub" == "restart" ) && "$daemon" != "-d" ]]; then
     daemon="-d"
-    forced_daemon="both 需后台运行（前台会阻断第二个实例），已自动加 -d"
+    forced_daemon="多实例需后台运行（前台会阻断后续实例），已自动加 -d"
 fi
 [[ -n "$forced_daemon" ]] && echo "提示: $forced_daemon" >&2
 
-for t in $(expandTargets "$target"); do
+for t in $TARGETS; do
     case "$sub" in
         start)   start "$t" "$daemon" ;;
         stop)    stop "$t" ;;

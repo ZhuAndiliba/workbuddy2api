@@ -31,6 +31,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,22 +63,118 @@ type instance struct {
 func (in *instance) pidFile() string { return filepath.Join(in.root, "data", "run", in.Name+".pid") }
 func (in *instance) logFile() string { return filepath.Join(in.root, "data", "logs", in.Name+".log") }
 
-// instanceConfig 只取控制台需要的字段。
-type instanceConfig struct {
+// consoleConfig 控制台自己从 config 里读的字段。
+// 与 cmd/server 的 Config 同构（共享段 + instances 分节），但只取控制台要用的部分：
+// listen / api_key / console / instances。实例覆盖字段只需 listen 与 api_key——
+// 其余（region、state_file、pool…）是 server 的事。
+type consoleConfig struct {
 	Listen string `json:"listen"`
 	APIKey string `json:"api_key"`
+
+	Console struct {
+		Listen string `json:"listen"`
+		Token  string `json:"token"`
+	} `json:"console"`
+
+	Instances map[string]struct {
+		Listen string `json:"listen"`
+		APIKey string `json:"api_key"`
+	} `json:"instances"`
 }
 
+// instanceConfig 某个实例生效后的字段（共享段 + 该实例覆盖）。
+type instanceConfig struct {
+	Listen string
+	APIKey string
+}
+
+// configPath 实例的配置文件路径（相对 root）。
+func (in *instance) configPath() string {
+	if in.Config == "" {
+		return filepath.Join(in.root, "config.json")
+	}
+	return filepath.Join(in.root, in.Config)
+}
+
+// readConfig 读取该实例生效的配置：先取共享段，再用 instances[Name] 覆盖。
+// 兼容旧的"一实例一文件"格式（无 instances 分节时，共享段即该实例全部配置）。
 func (in *instance) readConfig() (instanceConfig, error) {
-	var c instanceConfig
-	raw, err := os.ReadFile(filepath.Join(in.root, in.Config))
+	raw, err := os.ReadFile(in.configPath())
 	if err != nil {
-		return c, err
+		return instanceConfig{}, err
 	}
+	var c consoleConfig
 	if err := json.Unmarshal(raw, &c); err != nil {
-		return c, err
+		return instanceConfig{}, err
 	}
-	return c, nil
+	out := instanceConfig{Listen: c.Listen, APIKey: c.APIKey}
+	// 多实例格式：该实例的覆盖字段叠上去（只覆盖出现过的非空值）。
+	if ov, ok := c.Instances[in.Name]; ok {
+		if ov.Listen != "" {
+			out.Listen = ov.Listen
+		}
+		if ov.APIKey != "" {
+			out.APIKey = ov.APIKey
+		}
+	} else if len(c.Instances) > 0 {
+		// 文件是多实例格式，但没有这个实例 → 明确报错，别静默用共享段（会指错端口）。
+		return instanceConfig{}, fmt.Errorf("config 里没有实例 %q（可选：%s）",
+			in.Name, strings.Join(sortedKeys(c.Instances), ", "))
+	}
+	return out, nil
+}
+
+// instanceNames 读取 config 的 instances 分节里的实例名（排序）。
+// ok=false 表示配置读不出来（文件不存在/不是 JSON）；此时 names 为空，
+// 调用方据此区分"单实例格式"（ok=true 且无名字）与"根本没配置"。
+func instanceNames(path string) (names []string, ok bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var c consoleConfig
+	if json.Unmarshal(raw, &c) != nil {
+		return nil, false
+	}
+	return sortedKeys(c.Instances), true
+}
+
+// labelOf 实例展示名：两个已知实例给中文名，其余用实例名本身。
+// 仅用于展示，改这里不影响任何按名字匹配的逻辑。
+func labelOf(name string) string {
+	switch name {
+	case "cn":
+		return "CN"
+	case "global":
+		return "国际站"
+	}
+	return name
+}
+
+// readConsoleSection 读取 config 的 console 段（listen/token）。
+// 返回 ok=false 表示文件里没有 console 段（此时用命令行参数/默认值）。
+func readConsoleSection(path string) (listen, token string, ok bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", false
+	}
+	var c consoleConfig
+	if json.Unmarshal(raw, &c) != nil {
+		return "", "", false
+	}
+	if c.Console.Listen == "" && c.Console.Token == "" {
+		return "", "", false
+	}
+	return c.Console.Listen, c.Console.Token, true
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (in *instance) port() string {
@@ -211,7 +308,7 @@ func (in *instance) start() error {
 	}
 	defer lf.Close()
 
-	cmd := exec.Command(bin, "-config", in.Config)
+	cmd := exec.Command(bin, "-config", in.Config, "-instance", in.Name)
 	cmd.Dir = in.root
 	cmd.Stdout = lf
 	cmd.Stderr = lf
@@ -727,38 +824,119 @@ func isLoopbackHost(listen string) bool {
 }
 
 func main() {
-	listen := flag.String("listen", defaultListen, "监听地址（默认仅本机可访问）")
-	token := flag.String("token", "", "控制令牌；绑非回环地址时必填")
-	root := flag.String("root", ".", "项目根目录（含 config.*.json / wb2api）")
+	listen := flag.String("listen", "", "监听地址；留空则用 config 的 console.listen，再回落 127.0.0.1:7860")
+	token := flag.String("token", "", "控制令牌；留空则用 config 的 console.token。绑非回环地址时必须非空")
+	root := flag.String("root", ".", "项目根目录（含 config.json / wb2api）")
+	cfgPath := flag.String("config", "config.json", "配置文件（相对 root）")
+	instancesFlag := flag.String("instances", "", "受管实例，格式 name:Label[,name:Label]；留空则按 config 的 instances 分节推导")
+	printListen := flag.Bool("print-listen", false, "只打印解析后的监听地址后退出；供 run.sh 读端口")
 	flag.Parse()
-
-	if !isLoopbackHost(*listen) && *token == "" {
-		log.Fatalf("拒绝启动：-listen=%s 对非本机可见，但未设置 -token。进程控制面不允许裸奔。", *listen)
-	}
 
 	abs, err := filepath.Abs(*root)
 	if err != nil {
 		log.Fatalf("root 解析失败: %v", err)
 	}
 
+	// 命令行优先，其次 config 的 console 段，最后内置默认。
+	resolvedListen, resolvedToken := *listen, *token
+	if resolvedListen == "" || resolvedToken == "" {
+		cfgListen, cfgToken, ok := readConsoleSection(filepath.Join(abs, *cfgPath))
+		if ok {
+			if resolvedListen == "" {
+				resolvedListen = cfgListen
+			}
+			if resolvedToken == "" {
+				resolvedToken = cfgToken
+			}
+			if !*printListen {
+				log.Printf("已从 %s 的 console 段读取配置", *cfgPath)
+			}
+		}
+	}
+	if resolvedListen == "" {
+		resolvedListen = defaultListen
+	}
+	if *printListen {
+		fmt.Println(resolvedListen)
+		return
+	}
+
+	// 安全约束：对非本机可见时必须有 token（无论 token 来自命令行还是 config）。
+	if !isLoopbackHost(resolvedListen) && resolvedToken == "" {
+		log.Fatalf("拒绝启动：监听 %s 对非本机可见，但没有令牌。"+
+			"请在 config 的 console.token 里设置，或用 -token 传入。进程控制面不允许裸奔。", resolvedListen)
+	}
+
+	// 受管实例：命令行优先；留空则按 config 推导——多实例格式取 instances 分节全部实例，
+	// 单实例格式就管那一个（名字用 wb2api，与 run.sh 的 pid/日志命名一致）；
+	// 只在配置完全读不出来时才回落到内置的 cn/global 两个默认名字。
+	spec := *instancesFlag
+	derived := ""
+	if spec == "" {
+		names, ok := instanceNames(filepath.Join(abs, *cfgPath))
+		switch {
+		case len(names) > 0:
+			parts := make([]string, 0, len(names))
+			for _, n := range names {
+				parts = append(parts, n+":"+labelOf(n))
+			}
+			spec, derived = strings.Join(parts, ","), fmt.Sprintf("%s 的 instances 分节", *cfgPath)
+		case ok:
+			// 单实例格式：一个实例，别再摆出两个指向同一进程的卡片。
+			spec, derived = "wb2api:默认实例", fmt.Sprintf("%s（单实例格式）", *cfgPath)
+		}
+	}
+	if spec == "" {
+		spec = "cn:CN,global:国际站"
+	}
+	insts := parseInstances(spec, abs, *cfgPath)
+	if derived != "" {
+		log.Printf("已按 %s 推导受管实例", derived)
+	}
+
 	s := &Server{
-		root: abs,
-		instances: []*instance{
-			{Name: "cn", Label: "CN", Config: "config.cn.json", root: abs},
-			{Name: "global", Label: "国际站", Config: "config.global.json", root: abs},
-		},
-		token:       *token,
+		root:        abs,
+		instances:   insts,
+		token:       resolvedToken,
 		modelsCache: map[string]modelsEntry{},
 	}
 
 	srv := &http.Server{
-		Addr:              *listen,
+		Addr:              resolvedListen,
 		Handler:           s.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("控制台 listening on http://%s/ （受管实例：cn :%s / global :%s）",
-		*listen, s.instances[0].port(), s.instances[1].port())
+	parts := make([]string, 0, len(insts))
+	for _, in := range insts {
+		parts = append(parts, fmt.Sprintf("%s :%s", in.Name, in.port()))
+	}
+	log.Printf("控制台 listening on http://%s/ （token=%v，受管实例：%s）",
+		resolvedListen, resolvedToken != "", strings.Join(parts, " / "))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
+}
+
+// parseInstances 解析 -instances 参数（"cn:CN,global:国际站"）为受管实例列表。
+// Label 可省略（只写 name 时用 name 本身当标签）。
+func parseInstances(spec, root, cfg string) []*instance {
+	var out []*instance
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, label, ok := strings.Cut(part, ":")
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if !ok || strings.TrimSpace(label) == "" {
+			label = name
+		} else {
+			label = strings.TrimSpace(label)
+		}
+		out = append(out, &instance{Name: name, Label: label, Config: cfg, root: root})
+	}
+	return out
 }

@@ -1,16 +1,17 @@
 {
-  "listen": ":7863",
   "api_key": "your-api-key-here",
   "auth_dir": "./auths",
-  "state_file": "./data/state.json",
-  "region": "",
-  "models_extra": [],
   "cooldown": {
     "soft_rate": "60s"
   },
   "schedule": {
-    "checkin_hours": [9, 21],
-    "keepalive_hours": [22]
+    "checkin_hours": [
+      9,
+      21
+    ],
+    "keepalive_hours": [
+      22
+    ]
   },
   "upstream": {
     "timeout_seconds": 120,
@@ -36,5 +37,36 @@
     "enabled": true,
     "ttl": "30m",
     "gc_interval": "5m"
+  },
+  "console": {
+    "listen": "127.0.0.1:7860",
+    "token": "CHANGE-ME-console-token"
+  },
+  "instances": {
+    "cn": {
+      "region": "cn",
+      "listen": ":7864",
+      "state_file": "./data/state.cn.json",
+      "models_extra": [
+        "deepseek-v4-flash",
+        "deepseek-v3-2-volc",
+        "hy4-preview",
+        "glm-5.0-turbo",
+        "hunyuan-chat",
+        "kimi-k2.5"
+      ]
+    },
+    "global": {
+      "region": "global",
+      "listen": ":7865",
+      "state_file": "./data/state.global.json",
+      "models_extra": [
+        "deepseek-v4.1-flash",
+        "hy4-preview",
+        "hy3",
+        "gemini-3.1-pro",
+        "kimi-k2.5"
+      ]
+    }
   }
 }
