@@ -9,9 +9,14 @@ data/
 /credit
 /wb2api
 /signin_bin
+/console
 
 # Config with secrets (use config.example.json)
+# config.cn.json / config.global.json 同样含 api_key，一并排除；示例文件保留。
 config.json
+config.cn.json
+config.global.json
+!config.example.json
 
 # Build artifacts
 *.tmp
@@ -31,3 +36,6 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+
+# GUI 测试证据（截图）
+gui-test-screenshots/

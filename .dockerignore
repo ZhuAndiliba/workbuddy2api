@@ -1,11 +1,31 @@
-auths/
-data/
-*.tmp
+# 构建上下文瘦身：这些都不该进镜像
 .git/
 .gitignore
+auths/
+data/
+gui-test-screenshots/
+
+# 本机预编译的二进制（镜像里会重新编译）
+/wb2api
+/console
+/login
+/credit
+/signin_bin
+
+# 含密钥的配置（容器里通过 volumes 挂载，不烤进镜像）
+config.json
+config.cn.json
+config.global.json
+
+# 文档与临时文件
+*.md
+!README.md
 docs/
-scripts/
+LOOP.md
 PLAN.md
 SPEC.md
-LOOP.md
-README.md
+*.tmp
+__pycache__/
+backups/
+.idea/
+.vscode/

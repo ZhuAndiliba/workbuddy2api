@@ -1,13 +1,36 @@
+# docker-compose.yml — 一个容器内跑 CN + 国际站两个实例 + 控制台。
+#
+# 首次使用：
+#   cp config.example.json config.cn.json      # 改 "region": "cn"，api_key 换成强随机串
+#   cp config.example.json config.global.json  # 改 "region": "global"，注意 listen 用 :7865
+#   ./login.sh cn  /  ./login.sh global        # 生成 auths/*.json
+#   docker compose up -d --build
+#
+# 只跑一个区：删掉（或不创建）对应 config，entrypoint 会只启存在的那个。
+
 services:
   wb2api:
     build: .
-    container_name: workbuddy2api
+    image: wb2api:local
+    container_name: wb2api
     restart: unless-stopped
+    # 时区决定签到/保活的触发时刻，按需改
     environment:
       - TZ=Asia/Shanghai
+      # 控制台令牌：容器内控制台监听 0.0.0.0，务必设置（否则可被同网段访问并启停进程）
+      # 访问时用 http://<host>:7860/?token=<这里的值>
+      - WB2A_CONSOLE_TOKEN=${WB2A_CONSOLE_TOKEN:-}
     ports:
-      - "7863:7863"
+      # 只给本机访问就把左边改成 127.0.0.1:xxxx
+      - "7864:7864"   # CN 实例
+      - "7865:7865"   # 国际站实例
+      - "7860:7860"   # 控制台
     volumes:
+      # 凭证目录：读写（token 刷新后要写回）
       - ./auths:/app/auths
+      # 池状态：读写（持久化冷却/积分/计数）
       - ./data:/app/data
-      - ./config.json:/app/config.json:ro
+      # 两个实例的配置：只读挂载
+      - ./config.cn.json:/app/config.cn.json:ro
+      - ./config.global.json:/app/config.global.json:ro
+    # 容器内已有 HEALTHCHECK（见 Dockerfile）；如需覆盖可在此加 healthcheck
