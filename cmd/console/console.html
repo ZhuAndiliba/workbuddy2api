@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>workbuddy2api 控制台</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --border: #262b36; --fg: #e6e9ef;
+    --dim: #8b93a3; --accent: #4c8dff; --ok: #35c47a; --warn: #f0b429;
+    --err: #f2555a; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 22px; background: var(--bg); color: var(--fg);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+  h2 { font-size: 14px; color: var(--dim); font-weight: 600; margin: 26px 0 10px;
+       text-transform: uppercase; letter-spacing: .04em; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .card.off { opacity: .72; }
+  .head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .name { font-size: 16px; font-weight: 650; }
+  .port { font-family: var(--mono); font-size: 12px; color: var(--dim); }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+           font-weight: 600; border: 1px solid transparent; margin-left: auto; white-space: nowrap; }
+  .badge.ok   { background: rgba(53,196,122,.14); color: var(--ok);   border-color: rgba(53,196,122,.35); }
+  .badge.warn { background: rgba(240,180,41,.14); color: var(--warn); border-color: rgba(240,180,41,.35); }
+  .badge.err  { background: rgba(242,85,90,.14);  color: var(--err);  border-color: rgba(242,85,90,.35); }
+  .badge.dim  { background: rgba(139,147,163,.12); color: var(--dim); border-color: var(--border); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .stat .n { font-size: 20px; font-weight: 650; font-family: var(--mono); }
+  .stat .k { font-size: 12px; color: var(--dim); margin-top: 2px; }
+  .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+  .metric { text-align: center; }
+  .metric .n { font-size: 18px; font-weight: 650; font-family: var(--mono); }
+  .metric .k { font-size: 11px; color: var(--dim); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { cursor: pointer; border-radius: 8px; padding: 7px 13px; font: inherit;
+           font-weight: 600; border: 1px solid var(--border); background: #0c0e13; color: var(--fg); }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .38; cursor: not-allowed; }
+  button.primary { background: var(--ok); border-color: var(--ok); color: #04120a; }
+  button.danger  { background: transparent; border-color: rgba(242,85,90,.5); color: var(--err); }
+  button.mini    { padding: 2px 8px; font-size: 12px; font-weight: 500; border-radius: 6px; }
+  button.ghost   { color: var(--dim); font-weight: 500; }
+  a.link { color: var(--accent); text-decoration: none; font-size: 13px; }
+  a.link:hover { text-decoration: underline; }
+  a.link.disabled { color: var(--dim); pointer-events: none; }
+  .msg { font-size: 12px; font-family: var(--mono); margin-top: 10px; min-height: 16px; word-break: break-all; }
+  .msg.ok { color: var(--ok); } .msg.err { color: var(--err); }
+  .note { font-size: 12px; color: var(--warn); margin-top: 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  tr:last-child td { border-bottom: none; }
+  td.mono { font-family: var(--mono); }
+  .tablewrap { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+               padding: 0; overflow-x: auto; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill { font-family: var(--mono); font-size: 12px; background: #0c0e13;
+          border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; color: var(--dim); }
+  /* 日志卡片 */
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 6px 14px; font-weight: 500;
+                background: transparent; color: var(--dim); }
+  .seg button + button { border-left: 1px solid var(--border); }
+  .seg button.on { background: var(--accent); color: #fff; font-weight: 600; }
+  select { background: #0c0e13; color: var(--fg); border: 1px solid var(--border);
+           border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 13px; }
+  .logpre { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size: 12px;
+            line-height: 1.5; white-space: pre; overflow: auto; max-height: 420px;
+            background: #0c0e13; border: 1px solid var(--border); border-radius: 8px;
+            color: #cfd6e4; tab-size: 4; }
+  label.inline { display: inline-flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+  .foot { color: var(--dim); font-size: 12px; margin-top: 22px; }
+  .tablewrap { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+               padding: 0; overflow-x: auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>workbuddy2api 控制台 <span id="conn" class="badge dim">连接中</span></h1>
+  <div class="sub" id="sub">—</div>
+
+  <div class="stats" id="totals"></div>
+
+  <h2>实例</h2>
+  <div class="grid" id="cards"></div>
+
+  <h2>账号池</h2>
+  <div class="tablewrap">
+    <table>
+      <thead><tr>
+        <th>实例</th><th>UID</th><th>昵称</th><th>区域</th><th>积分</th>
+        <th>状态</th><th>成功率</th><th>在途</th><th>最近成功</th><th>操作</th>
+      </tr></thead>
+      <tbody id="accounts"><tr><td colspan="10" style="color:#8b93a3">—</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>模型</h2>
+  <div class="grid" id="models"></div>
+
+  <h2>日志</h2>
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <span class="seg" id="logtabs"></span>
+      <label class="inline">行数
+        <select id="loglines">
+          <option>100</option>
+          <option selected>300</option>
+          <option>1000</option>
+          <option>3000</option>
+        </select>
+      </label>
+      <label class="inline"><input type="checkbox" id="logfollow" checked> 跟随最新</label>
+      <label class="inline"><input type="checkbox" id="logauto" checked> 自动刷新</label>
+      <button class="ghost" id="logrefresh">刷新</button>
+      <span class="port" id="logmeta"></span>
+    </div>
+    <pre class="logpre" id="logbody">—</pre>
+  </div>
+
+  <div class="foot">
+    控制台独立于网关运行：停掉任一实例都不会影响本页面。启停与运维按钮直接作用于本机进程 / 实例接口。
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+let busy = false;
+let lastState = null;
+
+function api(path, opts) {
+  const o = Object.assign({ headers: {} }, opts || {});
+  if (TOKEN) o.headers['X-Console-Token'] = TOKEN;
+  if (o.body) o.headers['Content-Type'] = 'application/json';
+  return fetch(path, o);
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+function badge(cls, text) { return `<span class="badge ${cls}">${esc(text)}</span>`; }
+function fmtTime(s) {
+  if (!s) return '—';
+  const d = new Date(s);
+  return isNaN(d) || d.getFullYear() < 2000 ? '—'
+    : d.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+function fmtRemain(sec) {
+  if (!sec || sec <= 0) return '';
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.round(sec / 60) + 'm';
+  return (sec / 3600).toFixed(1) + 'h';
+}
+
+function healthInfo(v) {
+  if (!v.running && !v.health) return ['dim', '已停止'];
+  if (v.health === 200) return ['ok', '正常'];
+  if (v.health === 503) return ['warn', '无可用账号'];
+  if (v.health) return ['err', 'HTTP ' + v.health];
+  return ['dim', '启动中…'];
+}
+
+function renderTotals(t) {
+  const items = [
+    ['账号总数', t.accounts], ['健康', t.healthy], ['冷却中', t.cooling],
+    ['禁用', t.disabled], ['总积分', t.credits],
+    ['实例', t.running + ' / ' + t.instances],
+  ];
+  $('totals').innerHTML = items.map(([k, v]) =>
+    `<div class="stat"><div class="n">${v == null ? '—' : v}</div><div class="k">${k}</div></div>`).join('');
+}
+
+function instanceCard(v) {
+  const [hcls, htext] = healthInfo(v);
+  const s = v.status || {};
+  const running = v.running;
+  const panelCls = v.panel && v.health ? 'link' : 'link disabled';
+  return `<div class="card ${running ? '' : 'off'}" data-name="${esc(v.name)}">
+    <div class="head">
+      <span class="name">${esc(v.label)}</span>
+      <span class="port">:${esc(v.port || '?')}</span>
+      ${badge(hcls, htext)}
+    </div>
+    <div class="metrics">
+      <div class="metric"><div class="n">${s.healthy != null ? s.healthy : '—'}</div><div class="k">健康</div></div>
+      <div class="metric"><div class="n">${s.total != null ? s.total : '—'}</div><div class="k">总账号</div></div>
+      <div class="metric"><div class="n">${s.cooling != null ? s.cooling : '—'}</div><div class="k">冷却</div></div>
+      <div class="metric"><div class="n">${s.in_flight_full != null ? s.in_flight_full : '—'}</div><div class="k">满载</div></div>
+    </div>
+    <div class="row">
+      <button class="primary" data-act="start" ${running ? 'disabled' : ''}>启动</button>
+      <button class="danger"  data-act="stop"  ${running ? '' : 'disabled'}>停止</button>
+      <button class="ghost"   data-act="restart" ${running ? '' : 'disabled'}>重启</button>
+      <a class="${panelCls}" href="${esc(v.panel || '#')}" target="_blank" rel="noopener">面板 ↗</a>
+      <button class="ghost" data-act="logs">日志</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="mini" data-act="checkin"   ${running ? '' : 'disabled'}>立即签到</button>
+      <button class="mini" data-act="keepalive" ${running ? '' : 'disabled'}>立即保活</button>
+      <button class="mini" data-act="revive"    ${running ? '' : 'disabled'}>解冻全部</button>
+    </div>
+    <div class="msg" data-msg="${esc(v.name)}"></div>
+    ${v.note ? `<div class="note">${esc(v.note)}</div>` : ''}
+    ${running && v.pid ? `<div class="port" style="margin-top:6px">pid ${v.pid}${s.region ? ' · region ' + esc(s.region) : ''}</div>` : ''}
+  </div>`;
+}
+
+function accountStatus(a) {
+  if (a.disabled) return badge('err', '禁用') + (a.reason ? ` <span class="port">${esc(a.reason)}</span>` : '');
+  if (a.cooling) {
+    const k = (a.cool_kind || '').replace('hard_credit', '余额').replace('soft_rate', '限流');
+    return badge('warn', `冷却 ${k} ${fmtRemain(a.cool_remaining_sec)}`);
+  }
+  if (a.breaker_fails > 0) return badge('ok', '健康') + ` <span class="port">熔断计数 ${a.breaker_fails}</span>`;
+  return badge('ok', '健康');
+}
+
+function renderAccounts(instances) {
+  const rows = [];
+  instances.forEach(v => {
+    const list = (v.status && v.status.accounts) || [];
+    list.forEach(a => {
+      const ok = a.success_count || 0, err = a.err_total || 0;
+      const rate = (ok + err) > 0 ? Math.round(ok * 100 / (ok + err)) + '%' : '—';
+      const canRevive = a.cooling;
+      rows.push(`<tr data-inst="${esc(v.name)}" data-uid="${esc(a.uid)}">
+        <td>${badge('dim', v.label)}</td>
+        <td class="mono">${esc((a.uid || '').slice(0, 8))}</td>
+        <td>${esc(a.nickname || '—')}</td>
+        <td>${badge('dim', a.region || '—')}</td>
+        <td class="mono">${a.credits == null ? '—' : a.credits}</td>
+        <td>${accountStatus(a)}</td>
+        <td class="mono">${rate} <span class="port">(${ok}/${ok + err})</span></td>
+        <td class="mono">${a.in_flight == null ? '—' : a.in_flight}</td>
+        <td class="port">${fmtTime(a.last_success)}</td>
+        <td><button class="mini" data-revive="${esc(a.uid)}" data-inst="${esc(v.name)}" ${canRevive ? '' : 'disabled'}>解冻</button></td>
+      </tr>`);
+    });
+  });
+  $('accounts').innerHTML = rows.length ? rows.join('')
+    : '<tr><td colspan="10" style="color:#8b93a3">没有账号（实例未运行，或区域过滤后为空）</td></tr>';
+
+  document.querySelectorAll('[data-revive]').forEach(b => {
+    b.onclick = () => {
+      const inst = b.getAttribute('data-inst');
+      const uid = b.getAttribute('data-revive');
+      // 账号行在实例卡片之外，反馈要打到对应实例卡片的 .msg 上。
+      const card = document.querySelector(`[data-name="${inst}"]`);
+      doAction(inst, 'revive', card, uid);
+    };
+  });
+}
+
+function renderModels(instances) {
+  const cards = instances.filter(v => v.running).map(v => {
+    const ids = v.models || [];
+    return `<div class="card">
+      <div class="head"><span class="name">${esc(v.label)}</span>
+        <span class="port">${ids.length} 个</span></div>
+      <div class="pills">${ids.length ? ids.map(id => `<span class="pill">${esc(id)}</span>`).join('')
+        : '<span class="port">（拉取失败或实例未运行）</span>'}</div>
+    </div>`;
+  });
+  $('models').innerHTML = cards.length ? cards.join('')
+    : '<div class="card"><span class="port">没有运行中的实例</span></div>';
+}
+
+function render(st) {
+  lastState = st;
+  renderTotals(st.totals || {});
+  $('cards').innerHTML = st.instances.map(instanceCard).join('');
+  renderAccounts(st.instances);
+  renderModels(st.instances);
+  $('conn').className = 'badge ok';
+  $('conn').textContent = '已连接';
+  $('sub').textContent = `运行中 ${(st.totals || {}).running || 0} / ${(st.totals || {}).instances || 0} 个实例 · `
+    + `更新于 ${new Date(st.ts * 1000).toLocaleTimeString('zh-CN', { hour12: false })}`;
+  bind();
+}
+
+function bind() {
+  document.querySelectorAll('[data-act]').forEach(btn => {
+    btn.onclick = () => {
+      const card = btn.closest('[data-name]');
+      const target = card.getAttribute('data-name');
+      const act = btn.getAttribute('data-act');
+      if (act === 'logs') return showLogs(target);
+      return doAction(target, act, card);
+    };
+  });
+}
+
+function setMsg(card, text, ok) {
+  if (!card) return;
+  const el = card.querySelector('.msg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+}
+
+async function doAction(target, action, card, uid) {
+  if (busy) return;
+  busy = true;
+  const btns = card ? card.querySelectorAll('button') : [];
+  btns.forEach(b => b.disabled = true);
+  const label = action === 'revive' && uid ? '解冻 ' + uid.slice(0, 8) : action;
+  setMsg(card, label + ' 中…', true);
+  try {
+    const body = { target, action };
+    if (uid) body.uid = uid;
+    const r = await api('/api/action', { method: 'POST', body: JSON.stringify(body) });
+    const j = await r.json();
+    setMsg(card, j.message || (j.ok ? '完成' : '失败'), !!j.ok);
+  } catch (e) {
+    setMsg(card, '请求失败: ' + e.message, false);
+  } finally {
+    busy = false;
+    await refresh();   // 按钮状态由新数据决定
+  }
+}
+
+// ── 日志卡片：常驻展示某个实例的日志尾部，可切换实例 / 行数 / 跟随。
+// 只更新 <pre> 文本，不重建整块 DOM，避免每 3 秒把滚动位置和选择状态冲掉。
+// 初始实例可用 ?log=global 指定（便于收藏/直达），非法值回落 cn。
+const LOG_TARGETS = [{ name: 'cn', label: 'CN' }, { name: 'global', label: '国际站' }];
+
+function initialLogTarget() {
+  const q = new URLSearchParams(location.search).get('log');
+  return LOG_TARGETS.some(t => t.name === q) ? q : 'cn';
+}
+
+let logTarget = initialLogTarget();
+let logMetaAt = 0;
+
+function renderLogTabs() {
+  $('logtabs').innerHTML = LOG_TARGETS.map(t =>
+    `<button class="${t.name === logTarget ? 'on' : ''}" data-log="${t.name}">${esc(t.label)}</button>`).join('');
+  $('logtabs').querySelectorAll('[data-log]').forEach(b => {
+    b.onclick = () => { logTarget = b.getAttribute('data-log'); renderLogTabs(); loadLogs(); };
+  });
+}
+
+async function loadLogs() {
+  const body = $('logbody');
+  const follow = $('logfollow').checked;
+  const keepTop = body.scrollTop;              // 不跟随时保住用户当前滚动位置
+  const lines = $('loglines').value;
+  try {
+    const r = await api(`/api/logs?target=${encodeURIComponent(logTarget)}&lines=${encodeURIComponent(lines)}`);
+    const j = await r.json();
+    if (!r.ok) { body.textContent = '读取失败：' + (j.message || 'HTTP ' + r.status); return; }
+    const text = j.lines || '（无输出）';
+    if (body.textContent !== text) body.textContent = text;
+    if (follow) body.scrollTop = body.scrollHeight;
+    else body.scrollTop = keepTop;
+    logMetaAt = Date.now();
+    $('logmeta').textContent = `${lines} 行 · ${new Date(logMetaAt).toLocaleTimeString('zh-CN', { hour12: false })}`;
+  } catch (e) {
+    body.textContent = '读取失败: ' + e.message;
+  }
+}
+
+// showLogs 供实例卡片的「日志」按钮调用：切到该实例并把日志卡片滚进视野。
+function showLogs(target) {
+  logTarget = target;
+  renderLogTabs();
+  loadLogs();
+  $('logbody').closest('.card').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function refresh() {
+  try {
+    const r = await api('/api/state');
+    if (!r.ok) {
+      $('conn').className = 'badge err';
+      $('conn').textContent = r.status === 401 ? '未授权（需 token）' : 'HTTP ' + r.status;
+      return;
+    }
+    render(await r.json());
+    if ($('logauto').checked) await loadLogs();
+  } catch (e) {
+    $('conn').className = 'badge err';
+    $('conn').textContent = '连接失败';
+  }
+}
+
+$('logrefresh').onclick = loadLogs;
+$('loglines').onchange = loadLogs;
+$('logfollow').onchange = loadLogs;
+
+renderLogTabs();
+refresh();
+loadLogs();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

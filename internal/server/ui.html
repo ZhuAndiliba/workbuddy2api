@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>workbuddy2api 面板</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --border: #262b36; --fg: #e6e9ef;
+    --dim: #8b93a3; --accent: #4c8dff; --ok: #35c47a; --warn: #f0b429;
+    --err: #f2555a; --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 4px; display: flex; align-items: center; gap: 10px; }
+  h2 { font-size: 14px; color: var(--dim); font-weight: 600; margin: 24px 0 10px;
+       text-transform: uppercase; letter-spacing: .04em; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px;
+           font-weight: 600; border: 1px solid transparent; }
+  .badge.ok   { background: rgba(53,196,122,.14); color: var(--ok);   border-color: rgba(53,196,122,.35); }
+  .badge.warn { background: rgba(240,180,41,.14); color: var(--warn); border-color: rgba(240,180,41,.35); }
+  .badge.err  { background: rgba(242,85,90,.14);  color: var(--err);  border-color: rgba(242,85,90,.35); }
+  .badge.dim  { background: rgba(139,147,163,.12); color: var(--dim); border-color: var(--border); }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
+  .stat { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .stat .n { font-size: 22px; font-weight: 650; font-family: var(--mono); }
+  .stat .k { font-size: 12px; color: var(--dim); margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 600; font-size: 12px; }
+  td.mono { font-family: var(--mono); }
+  tr:last-child td { border-bottom: none; }
+  input, select, textarea, button {
+    background: #0c0e13; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font: inherit; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  button { cursor: pointer; background: var(--accent); border-color: var(--accent);
+           color: #fff; font-weight: 600; padding: 8px 16px; }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: transparent; border-color: var(--border); color: var(--dim); font-weight: 500; }
+  textarea { width: 100%; resize: vertical; min-height: 64px; font-family: var(--mono); font-size: 13px; }
+  .muted { color: var(--dim); }
+  .err-text { color: var(--err); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; }
+  #answer { min-height: 60px; white-space: pre-wrap; font-family: var(--mono); font-size: 13px;
+            background: #0c0e13; border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; }
+  .pill { font-family: var(--mono); font-size: 12px; background: #0c0e13;
+          border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; color: var(--dim); }
+  a { color: var(--accent); }
+  .sep { color: var(--border); }
+  label.inline { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>
+    workbuddy2api
+    <span id="region" class="badge dim">—</span>
+    <span id="health" class="badge dim">连接中</span>
+  </h1>
+  <div class="sub">
+    实例 <span class="mono" id="origin"></span>
+    <span class="sep">·</span> 切换：
+    <a href="#" data-port="7864">CN :7864</a>
+    <span class="sep">·</span>
+    <a href="#" data-port="7865">国际站 :7865</a>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="apikey" type="password" placeholder="API Key（api_key 为空则留空）" style="flex:1;min-width:220px">
+      <button id="save">保存并刷新</button>
+      <label class="inline"><input type="checkbox" id="auto" checked> 自动刷新 5s</label>
+      <button class="ghost" id="refresh">立即刷新</button>
+    </div>
+    <div id="autherr" class="err-text" style="margin-top:8px"></div>
+  </div>
+
+  <h2>账号池</h2>
+  <div class="stats" id="stats"></div>
+  <div class="card" style="margin-top:12px;padding:0;overflow-x:auto">
+    <table>
+      <thead><tr>
+        <th>UID</th><th>昵称</th><th>区域</th><th>积分</th>
+        <th>状态</th><th>成功率</th><th>在途</th><th>最近成功</th>
+      </tr></thead>
+      <tbody id="accounts"><tr><td colspan="8" class="muted">—</td></tr></tbody>
+    </table>
+  </div>
+
+  <h2>模型</h2>
+  <div class="card"><div class="pills" id="models"><span class="muted">—</span></div></div>
+
+  <h2>聊天测试</h2>
+  <div class="card">
+    <div class="row" style="margin-bottom:10px">
+      <select id="model" style="min-width:220px"></select>
+      <label class="inline"><input type="checkbox" id="createsys"> 空 system 首条</label>
+      <span class="muted" style="font-size:12px">（国际站强制首条为 system，网关已自动补齐；勾选可临时关闭）</span>
+    </div>
+    <textarea id="prompt" placeholder="输入消息，Cmd/Ctrl+Enter 发送">你好，用一句话自我介绍</textarea>
+    <div class="row" style="margin-top:10px">
+      <button id="send">发送</button>
+      <span id="meta" class="muted" style="font-size:12px"></span>
+    </div>
+    <div id="answer" style="margin-top:12px" class="muted">—</div>
+  </div>
+
+  <div class="muted" style="font-size:12px;margin:24px 0 8px">
+    提示：API Key 只存在本机浏览器 localStorage，不会发往除网关以外的任何地方。
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let timer = null, running = false;
+
+function origin() { return location.origin; }
+
+function headers() {
+  const k = localStorage.getItem('wb2a_key') || '';
+  const h = { 'Content-Type': 'application/json' };
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  return h;
+}
+
+function fmtTime(s) {
+  if (!s || s.startsWith('0001-01-01')) return '—';
+  const d = new Date(s);
+  if (isNaN(d)) return '—';
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+function fmtRemain(sec) {
+  if (!sec || sec <= 0) return '';
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.round(sec / 60) + 'm';
+  return (sec / 3600).toFixed(1) + 'h';
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+async function loadStatus() {
+  const r = await fetch('/status', { headers: headers() });
+  if (r.status === 401) { showAuthErr('API Key 无效或缺失（401）'); return null; }
+  if (!r.ok) { showAuthErr('HTTP ' + r.status); return null; }
+  showAuthErr('');
+  return r.json();
+}
+
+function showAuthErr(msg) {
+  $('autherr').textContent = msg || '';
+}
+
+// setHealth 更新顶部健康徽标。此前它恒停在初始的"连接中"——因为没有代码改它。
+function setHealth(kind, text) {
+  $('health').textContent = text;
+  $('health').className = 'badge ' + kind;
+}
+
+function renderStats(d) {
+  const items = [
+    ['总账号', d.total], ['健康', d.healthy], ['冷却中', d.cooling],
+    ['禁用', d.disabled], ['满载', d.in_flight_full], ['粘性会话', d.sticky_sessions],
+  ];
+  $('stats').innerHTML = items.map(([k, v]) =>
+    `<div class="stat"><div class="n">${v == null ? '—' : v}</div><div class="k">${k}</div></div>`).join('');
+  $('region').textContent = d.region || '—';
+  $('region').className = 'badge ' + (d.region === 'both' ? 'dim' : 'ok');
+}
+
+function renderAccounts(list) {
+  if (!list || !list.length) {
+    $('accounts').innerHTML = '<tr><td colspan="8" class="muted">该实例没有账号（区域过滤后为空）</td></tr>';
+    return;
+  }
+  $('accounts').innerHTML = list.map(a => {
+    let st = '<span class="badge ok">健康</span>';
+    if (a.disabled) st = '<span class="badge err">禁用</span>' + (a.reason ? ' <span class="muted">' + esc(a.reason) + '</span>' : '');
+    else if (a.cooling) {
+      const k = (a.cool_kind || '').replace('hard_credit', '余额').replace('soft_rate', '限流');
+      st = `<span class="badge warn">冷却 ${k} ${fmtRemain(a.cool_remaining_sec)}</span>`;
+    } else if (a.in_flight > 0) st = `<span class="badge dim">在途 ${a.in_flight}</span>`;
+
+    const ok = a.success_count || 0, err = a.err_total || 0;
+    const rate = (ok + err) > 0 ? Math.round(ok * 100 / (ok + err)) + '%' : '—';
+    const brk = a.breaker_fails ? ` <span class="badge err">熔断计数 ${a.breaker_fails}</span>` : '';
+    return `<tr>
+      <td class="mono">${esc((a.uid || '').slice(0, 8))}</td>
+      <td>${esc(a.nickname || '—')}</td>
+      <td><span class="badge dim">${esc(a.region || '—')}</span></td>
+      <td class="mono">${a.credits == null ? '—' : a.credits}</td>
+      <td>${st}${brk}</td>
+      <td class="mono">${rate} <span class="muted">(${ok}/${ok + err})</span></td>
+      <td class="mono">${a.in_flight == null ? '—' : a.in_flight}</td>
+      <td class="muted" style="font-size:12px">${fmtTime(a.last_success)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadModels() {
+  const r = await fetch('/v1/models', { headers: headers() });
+  if (!r.ok) { $('models').innerHTML = '<span class="muted">加载失败 HTTP ' + r.status + '</span>'; return; }
+  const d = await r.json();
+  const ids = (d.data || []).map(m => m.id);
+  $('models').innerHTML = ids.length
+    ? ids.map(id => `<span class="pill">${esc(id)}</span>`).join('')
+    : '<span class="muted">—</span>';
+  const cur = $('model').value;
+  $('model').innerHTML = ids.map(id => `<option value="${esc(id)}">${esc(id)}</option>`).join('');
+  if (ids.includes(cur)) $('model').value = cur;
+}
+
+async function refresh() {
+  try {
+    const d = await loadStatus();
+    if (d) {
+      renderStats(d);
+      renderAccounts(d.accounts);
+      setHealth('ok', '正常');
+    } else {
+      setHealth('err', '未连接');
+    }
+  } catch (e) {
+    showAuthErr('连接失败: ' + e.message);
+    setHealth('err', '连接失败');
+  }
+}
+
+async function send() {
+  if (running) return;
+  const model = $('model').value;
+  const text = $('prompt').value.trim();
+  if (!model) { alert('请先选择模型'); return; }
+  if (!text) return;
+
+  const msgs = [];
+  if ($('createsys').checked) msgs.push({ role: 'system', content: '' });
+  msgs.push({ role: 'user', content: text });
+
+  running = true;
+  $('send').disabled = true;
+  $('answer').textContent = '';
+  $('answer').classList.remove('muted');
+  $('meta').textContent = '请求中…';
+  const t0 = performance.now();
+  let out = '', ttfb = 0, toks = 0;
+
+  try {
+    const r = await fetch('/v1/chat/completions', {
+      method: 'POST', headers: headers(),
+      body: JSON.stringify({ model, messages: msgs, stream: true }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      $('answer').innerHTML = '<span class="err-text">HTTP ' + r.status + ' ' + esc(t.slice(0, 600)) + '</span>';
+      $('meta').textContent = '';
+      return;
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop();
+      for (const p of parts) {
+        const line = p.trim();
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') continue;
+        if (!ttfb) ttfb = performance.now() - t0;
+        try {
+          const j = JSON.parse(payload);
+          if (j.error) { $('answer').innerHTML = '<span class="err-text">' + esc(JSON.stringify(j.error)) + '</span>'; continue; }
+          const c = (j.choices || [])[0] || {};
+          const d2 = c.delta || {};
+          // reasoning_content（思考内容）有意不显示，只累积正式回答。
+          if (d2.content) { out += d2.content; $('answer').textContent = out; }
+          if (j.usage && j.usage.completion_tokens) toks = j.usage.completion_tokens;
+        } catch (_) { /* 非 JSON 帧忽略 */ }
+      }
+    }
+    const total = (performance.now() - t0) / 1000;
+    $('meta').textContent = `TTFB ${(ttfb / 1000).toFixed(2)}s · 总 ${total.toFixed(2)}s`
+      + (toks ? ` · ${toks} tok · ${(toks / total).toFixed(1)} tok/s` : '');
+    if (!out) $('answer').innerHTML = '<span class="muted">（空响应）</span>';
+  } catch (e) {
+    $('answer').innerHTML = '<span class="err-text">' + esc(e.message) + '</span>';
+  } finally {
+    running = false;
+    $('send').disabled = false;
+  }
+}
+
+function setAuto(on) {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (on) timer = setInterval(refresh, 5000);
+}
+
+// ---- 初始化 ----
+$('origin').textContent = origin();
+$('apikey').value = localStorage.getItem('wb2a_key') || '';
+$('save').onclick = () => {
+  const v = $('apikey').value.trim();
+  if (v) localStorage.setItem('wb2a_key', v); else localStorage.removeItem('wb2a_key');
+  refresh(); loadModels();
+};
+$('refresh').onclick = () => { refresh(); loadModels(); };
+$('auto').onchange = (e) => setAuto(e.target.checked);
+$('send').onclick = send;
+$('prompt').addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+});
+document.querySelectorAll('[data-port]').forEach(a => {
+  a.onclick = (e) => {
+    e.preventDefault();
+    const p = a.getAttribute('data-port');
+    const proto = location.protocol === 'https:' ? 'https:' : 'http:';
+    location.href = `${proto}//${location.hostname}:${p}/ui`;
+  };
+});
+
+refresh();
+loadModels();
+setAuto(true);
+</script>
+</body>
+</html>

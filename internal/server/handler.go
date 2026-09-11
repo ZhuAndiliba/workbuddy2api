@@ -4,6 +4,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -31,6 +32,13 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429 冷却，默认 60s
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// Region 本实例限定的区域（"cn" / "global"；空 = 两区混编）。仅作观测与
+	// 区域偏好兜底，账号过滤在启动时（auth.FilterRegion）已完成。
+	Region string
+	// OnCheckin / OnKeepalive 手动触发定时任务（网页控制台用）。
+	// nil 时对应端点返回 501，便于只装配 HTTP 层的测试与裁剪部署。
+	OnCheckin   func()
+	OnKeepalive func()
 }
 
 // Handler 主路由。
@@ -55,7 +63,72 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// 运维面板（静态壳，无鉴权；数据仍走上面各鉴权接口）+ 根路径跳转。
+	h.mux.HandleFunc("GET /ui", h.ui)
+	h.mux.HandleFunc("GET /{$}", h.root)
+	// 账号池运维动作（走 withAuth，与 /status 同级别的保护）。
+	// 这些会真实触发上游调用或改动池状态，因此不放无鉴权路径。
+	h.mux.HandleFunc("POST /admin/checkin", h.withAuth(h.adminCheckin))
+	h.mux.HandleFunc("POST /admin/keepalive", h.withAuth(h.adminKeepalive))
+	h.mux.HandleFunc("POST /admin/revive", h.withAuth(h.adminRevive))
 	return h
+}
+
+// adminCheckin 立即对全部账号执行签到 + 余额刷新（复用定时任务同一实现）。
+func (h *Handler) adminCheckin(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.OnCheckin == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"ok": false, "message": "本实例未装配签到能力"})
+		return
+	}
+	n, _, _, _, _ := h.cfg.Pool.CountsDetailed()
+	h.cfg.OnCheckin()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "message": fmt.Sprintf("已对 %d 个账号执行签到 + 余额刷新", n),
+	})
+}
+
+// adminKeepalive 立即刷新全部账号 token（复用定时任务同一实现）。
+func (h *Handler) adminKeepalive(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.OnKeepalive == nil {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{"ok": false, "message": "本实例未装配保活能力"})
+		return
+	}
+	total, _, _, _, _ := h.cfg.Pool.CountsDetailed()
+	h.cfg.OnKeepalive()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "message": fmt.Sprintf("已对 %d 个账号刷新 token", total),
+	})
+}
+
+// adminRevive 手动解冻：body {"uid":"..."} 解冻单个，空 body 或 {} 解冻全部。
+// 只清冷却，不碰熔断与 disabled（语义同"签到解冻"）。
+func (h *Handler) adminRevive(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UID string `json:"uid"`
+	}
+	// 允许空 body：读失败就当"解冻全部"。
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req)
+
+	if req.UID == "" {
+		n := h.cfg.Pool.ReviveAll()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "message": fmt.Sprintf("已解冻 %d 个账号的冷却", n),
+		})
+		return
+	}
+	if !h.cfg.Pool.Revive(req.UID) {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "message": "账号不存在: " + req.UID})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "已解冻 " + shortUID(req.UID)})
+}
+
+// shortUID 仅用于提示文案，避免把完整 uid 反复打到前端。
+func shortUID(uid string) string {
+	if len(uid) > 8 {
+		return uid[:8]
+	}
+	return uid
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +169,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	if redisMode == "" {
 		redisMode = "noop"
 	}
+	instanceRegion := h.cfg.Region
+	if instanceRegion == "" {
+		instanceRegion = "both"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":        h.cfg.Pool.List(),
 		"total":           total,
@@ -105,6 +182,7 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		"in_flight_full":  inFlightFull,
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		"region":          instanceRegion,
 	})
 }
 
@@ -122,12 +200,18 @@ var staticModels = []map[string]any{
 	{"id": "deepseek-v4-flash", "object": "model", "created": 1753600000, "owned_by": "workbuddy", "context_length": 131072},
 }
 
-// dynamicModelsCache 动态模型缓存。
-var dynamicModelsCache struct {
-	sync.RWMutex
+// dynamicModelsCache 动态模型缓存（按区域分桶）。
+// 各区域上游模型表不同（CN 与 global 是两套部署），必须分区缓存，
+// 否则一个区的成功拉取会覆盖另一个区的列表。
+type modelsBucket struct {
 	ids      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
+}
+
+var dynamicModelsCache struct {
+	sync.RWMutex
+	byRegion map[string]*modelsBucket
 }
 
 const (
@@ -143,64 +227,132 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
+// modelList 汇总各区域动态模型（含 context_length）；全部区域都拿不到时回退静态表。
+// 多区域账号池下取并集：客户端只关心"这个网关能跑哪些模型"，不必区分账号来自哪个区。
 func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
-		out := make([]map[string]any, 0, len(infos))
-		for _, mi := range infos {
-			entry := map[string]any{
-				"id":                mi.ID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "workbuddy",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
-			}
-			out = append(out, entry)
-		}
-		return out
+	regions := h.cfg.Pool.Regions()
+	if len(regions) == 0 {
+		return staticModels
 	}
-	return staticModels
+	seen := map[string]bool{}
+	out := make([]map[string]any, 0, len(staticModels))
+	for _, region := range regions {
+		for _, mi := range h.fetchDynamicModels(region) {
+			if mi.ID == "" || seen[mi.ID] {
+				continue
+			}
+			seen[mi.ID] = true
+			out = append(out, modelEntry(mi))
+		}
+	}
+	if len(out) == 0 {
+		return staticModels
+	}
+	return out
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
-// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
-func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
-		return out
+// modelEntry 把单个上游模型信息包装成 OpenAI 模型对象。
+func modelEntry(mi upstream.ModelInfo) map[string]any {
+	ctx := mi.ContextWindow
+	if ctx == 0 {
+		ctx = 131072 // 兜底
 	}
-	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
-		return nil
+	return map[string]any{
+		"id":                mi.ID,
+		"object":            "model",
+		"created":           1753600000,
+		"owned_by":          "workbuddy",
+		"context_length":    ctx,
+		"max_output_tokens": mi.MaxTokens,
 	}
-	dynamicModelsCache.RUnlock()
+}
 
-	acct := h.cfg.Pool.Pick()
+// fetchDynamicModels 从指定区域的任一健康账号拉模型列表（含 contextWindow/maxTokens），按区缓存 1h。
+// 拉取失败记录时间戳进入该区 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
+func (h *Handler) fetchDynamicModels(region string) []upstream.ModelInfo {
+	dynamicModelsCache.RLock()
+	b := dynamicModelsCache.byRegion[region]
+	dynamicModelsCache.RUnlock()
+	if b != nil {
+		if len(b.ids) > 0 && time.Since(b.fetched) < dynamicModelsTTL {
+			return b.ids
+		}
+		// 失败负缓存：冷却期内不再请求上游。
+		if !b.lastFail.IsZero() && time.Since(b.lastFail) < modelsFetchFailCooldown {
+			return nil
+		}
+	}
+
+	acct := h.cfg.Pool.PickExcludingInRegion(region, nil)
 	if acct == nil {
 		return nil
 	}
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
+		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持本区负缓存。
 		h.cfg.Pool.NoteError(acct.UID)
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
+		h.storeModelsBucket(region, nil, time.Now())
 		return nil
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	dynamicModelsCache.Unlock()
+	h.storeModelsBucket(region, infos, time.Time{})
 	return infos
+}
+
+// storeModelsBucket 写入某区域的模型缓存（lastFail 非零表示失败负缓存，成功时清空）。
+func (h *Handler) storeModelsBucket(region string, infos []upstream.ModelInfo, lastFail time.Time) {
+	dynamicModelsCache.Lock()
+	defer dynamicModelsCache.Unlock()
+	if dynamicModelsCache.byRegion == nil {
+		dynamicModelsCache.byRegion = map[string]*modelsBucket{}
+	}
+	b := dynamicModelsCache.byRegion[region]
+	if b == nil {
+		b = &modelsBucket{}
+		dynamicModelsCache.byRegion[region] = b
+	}
+	if lastFail.IsZero() {
+		b.ids = infos
+		b.fetched = time.Now()
+		b.lastFail = time.Time{}
+		return
+	}
+	b.lastFail = lastFail
+}
+
+// preferredRegion 返回该模型唯一可用的区域；无法判定（模型为空 / 各区都有 / 各区都没有）时返回空串。
+// 多区域账号池下用它把请求直接落到对的区，省掉"发错区 → 上游拒 → 换号"的一轮浪费。
+// 只在已有成功拉取缓存的区域间比较，缓存未就绪时返回空串（退回全区轮换，行为不变）。
+func (h *Handler) preferredRegion(model string) string {
+	// 实例已限定区域：池里只有该区账号，无需（也不该）再按模型推断区域。
+	if h.cfg.Region != "" {
+		return ""
+	}
+	if model == "" {
+		return ""
+	}
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	owner, found := "", false
+	for region, b := range dynamicModelsCache.byRegion {
+		if len(b.ids) == 0 {
+			continue
+		}
+		has := false
+		for _, mi := range b.ids {
+			if mi.ID == model {
+				has = true
+				break
+			}
+		}
+		if !has {
+			continue
+		}
+		if found {
+			return "" // 多个区都有 → 无需偏好
+		}
+		owner, found = region, true
+	}
+	return owner
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -220,6 +372,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+
+	// 模型 → 区域偏好：该模型只在某一个区存在时（如仅 CN 提供的模型），
+	// 把选号限定在该区，省掉"发错区 → 上游拒 → 换号"的整轮浪费。
+	// 单区域池 / 缓存未就绪 / 各区都有 → 空串，行为与改造前一致。
+	preferRegion := h.preferredRegion(parseModelFromBody(body))
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
@@ -260,14 +417,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUID(stickyUID)
-			if acct == nil {
+			if acct != nil && preferRegion != "" && acct.Region() != preferRegion {
+				// 粘性号区域与该模型不匹配（如会话先在 CN 号上建立，之后换了仅国际站提供的模型）：
+				// 解绑后改走偏好区，避免用错区的号白跑一轮。
+				// 注意：PickByUID 只记 lastUsed、不占在途租约（租约由下方 Acquire 拿），故此处不能 Release。
+				h.cfg.Session.Unbind(sessKey)
+				stickyUID = ""
+				acct = nil
+			} else if acct == nil {
 				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
 				stickyUID = ""
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.cfg.Pool.PickExcludingInRegion(preferRegion, tried)
+			if acct == nil && preferRegion != "" {
+				// 偏好区无可用号时放宽到全区：模型表可能滞后或不全，
+				// 不能仅凭"该模型只在这个区"就把请求锁死成 503。
+				acct = h.cfg.Pool.PickExcluding(tried)
+			}
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

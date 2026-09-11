@@ -48,14 +48,30 @@ func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body 
 				Body:       io.NopCloser(strings.NewReader(body)),
 			}, nil
 		})},
-		ChatBaseCN:    "https://fake.example",
-		BillingBaseCN: "https://fake.example",
+		ChatBaseCN:      "https://fake.example",
+		BillingBaseCN:   "https://fake.example",
+		ChatBaseGlobal:  "https://fake.global",
+		BillingBaseGlob: "https://fake.global",
 	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// resetModelsCache 清空按区域分桶的动态模型缓存（含负缓存），供各 models 测试从干净状态起跑。
+func resetModelsCache() {
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.byRegion = nil
+	dynamicModelsCache.Unlock()
+}
+
+// modelsCacheBucket 读取某区域的模型缓存桶（不存在返回 nil），供测试断言缓存内容。
+func modelsCacheBucket(region string) *modelsBucket {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	return dynamicModelsCache.byRegion[region]
+}
 
 // bindStore 记录粘性绑定镜像调用（不联网），供 D4 端到端断言绑定收敛到最终成功号。
 type bindStore struct {
@@ -435,6 +451,75 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 	}
 }
 
+// TestChatRoutesGlobalAccountToGlobalHost 端到端验证：国际站账号的请求打到国际站 host，
+// 且 Origin/Referer 同步为国际站（上游按来源区域校验，配错会 401）。
+func TestChatRoutesGlobalAccountToGlobalHost(t *testing.T) {
+	var gotHost, gotOrigin string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotHost, gotOrigin = r.URL.Host, r.Header.Get("Origin")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:      "https://fake.example",
+		BillingBaseCN:   "https://fake.example",
+		ChatBaseGlobal:  "https://fake.global",
+		BillingBaseGlob: "https://fake.global",
+	}
+	p := testPoolWith(&auth.Auth{
+		UID: "gl1", AccessToken: "at1", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai",
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotHost != "fake.global" {
+		t.Errorf("chat host=%q want fake.global (global account must not hit CN host)", gotHost)
+	}
+	if gotOrigin != "https://www.workbuddy.ai" {
+		t.Errorf("Origin=%q want global origin", gotOrigin)
+	}
+}
+
+// TestChatRoutesCNAccountToCNHost 对照组：CN 账号仍走 CN host + CN Origin（不得被改造带偏）。
+func TestChatRoutesCNAccountToCNHost(t *testing.T) {
+	var gotHost, gotOrigin string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotHost, gotOrigin = r.URL.Host, r.Header.Get("Origin")
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:      "https://fake.example",
+		BillingBaseCN:   "https://fake.example",
+		ChatBaseGlobal:  "https://fake.global",
+		BillingBaseGlob: "https://fake.global",
+	}
+	p := testPoolWith(&auth.Auth{UID: "cn1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if gotHost != "fake.example" {
+		t.Errorf("chat host=%q want fake.example (CN account)", gotHost)
+	}
+	if gotOrigin != "https://www.codebuddy.cn" {
+		t.Errorf("Origin=%q want CN origin", gotOrigin)
+	}
+}
+
 func TestModelsEndpoint(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
@@ -464,12 +549,7 @@ func TestModelsEndpoint(t *testing.T) {
 }
 
 func TestModelsDynamic(t *testing.T) {
-	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游返回动态模型（含 agents + maxInputTokens/maxOutputTokens）
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -518,21 +598,14 @@ func TestModelsDynamic(t *testing.T) {
 	}
 
 	// 第二次调用走缓存（把上游关掉也成功）
-	dynamicModelsCache.RLock()
-	cached := len(dynamicModelsCache.ids)
-	dynamicModelsCache.RUnlock()
-	if cached != 3 {
-		t.Errorf("cache not populated: %d", cached)
+	b := modelsCacheBucket(auth.RegionCN)
+	if b == nil || len(b.ids) != 3 {
+		t.Errorf("cache not populated: %+v", b)
 	}
 }
 
 func TestModelsDynamicFallsBackToStatic(t *testing.T) {
-	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	// 假上游 500
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -555,12 +628,7 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 }
 
 func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
-	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
@@ -580,18 +648,28 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 }
 
 func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
-	// 清缓存
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = nil
-	dynamicModelsCache.fetched = time.Time{}
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	resetModelsCache()
 
-	var calls int
-	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls++
-		return 500, `boom`, false
-	})
+	// 只数 /v3/config（主路径）的请求次数 = 逻辑上的 fetch 尝试次数。
+	// 不能数全部 HTTP 请求：FetchModels 内部在主路径失败后还会回落旧接口，
+	// 一次逻辑 fetch 会产生两个请求，那样断言会变成对实现细节的耦合。
+	var fetches int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v3/config") {
+				fetches++
+			}
+			return &http.Response{
+				StatusCode: 500,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`boom`)),
+			}, nil
+		})},
+		ChatBaseCN:      "https://fake.example",
+		BillingBaseCN:   "https://fake.example",
+		ChatBaseGlobal:  "https://fake.global",
+		BillingBaseGlob: "https://fake.global",
+	}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
@@ -604,21 +682,74 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	if calls != 1 {
-		t.Errorf("want 1 fetch, got %d", calls)
+	if fetches != 1 {
+		t.Errorf("want 1 fetch, got %d", fetches)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
 	dynamicModelsCache.Lock()
-	dynamicModelsCache.lastFail = time.Now().Add(-10 * time.Minute)
+	if b := dynamicModelsCache.byRegion[auth.RegionCN]; b != nil {
+		b.lastFail = time.Now().Add(-10 * time.Minute)
+	}
 	dynamicModelsCache.Unlock()
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/v1/models", nil))
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if calls != 2 {
-		t.Errorf("want 2 fetch after cooldown, got %d", calls)
+	if fetches != 2 {
+		t.Errorf("want 2 fetch after cooldown, got %d", fetches)
+	}
+}
+
+// TestUIRoute 面板是静态壳：无鉴权可拿（不含密钥），但配了 api_key 时数据接口仍要鉴权。
+func TestUIRoute(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "secret",
+	})
+
+	// /ui 无鉴权可访问（否则浏览器打开就先 401，没法用）。
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/ui", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET /ui: code=%d want 200 (must be reachable without api key)", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("content-type=%q want text/html", ct)
+	}
+	if rec.Header().Get("X-Frame-Options") != "DENY" {
+		t.Errorf("X-Frame-Options=%q want DENY (anti-clickjacking)", rec.Header().Get("X-Frame-Options"))
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "/v1/chat/completions") || !strings.Contains(body, "/status") {
+		t.Error("panel should call the authed endpoints from the browser")
+	}
+	// 页面本身不得内嵌密钥。
+	if strings.Contains(body, "secret") {
+		t.Error("panel must not embed the api key")
+	}
+
+	// 根路径跳转到面板。
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/", nil))
+	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/ui" {
+		t.Errorf("GET / : code=%d location=%q want 302 → /ui", rec.Code, rec.Header().Get("Location"))
+	}
+
+	// 未知路径仍是 404（根路径的兜底不能吞掉所有路径）。
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/nope", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /nope: code=%d want 404", rec.Code)
+	}
+
+	// 数据接口在配了 key 后仍必须鉴权（面板无鉴权不等于数据无鉴权）。
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("GET /status without key: code=%d want 401", rec.Code)
 	}
 }
 
@@ -867,5 +998,140 @@ func TestStatusRequiresAuth(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
 	if rec.Code != 200 {
 		t.Errorf("healthz: code=%d", rec.Code)
+	}
+}
+
+// TestAdminEndpointsRequireAuth 运维动作会真实触发上游调用或改池状态，必须走鉴权。
+func TestAdminEndpointsRequireAuth(t *testing.T) {
+	called := 0
+	h := NewHandler(Config{
+		Pool:        testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream:    upstream.New(),
+		APIKey:      "secret",
+		OnCheckin:   func() { called++ },
+		OnKeepalive: func() { called++ },
+	})
+	for _, ep := range []string{"/admin/checkin", "/admin/keepalive", "/admin/revive"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", ep, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s without key: code=%d want 401", ep, rec.Code)
+		}
+	}
+	if called != 0 {
+		t.Errorf("回调不得在未鉴权时触发，called=%d", called)
+	}
+}
+
+// TestAdminCheckinKeepalive 装配了回调时应调用它并回报账号数。
+func TestAdminCheckinKeepalive(t *testing.T) {
+	var checkin, keepalive int
+	h := NewHandler(Config{
+		Pool: testPoolWith(
+			&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999},
+			&auth.Auth{UID: "u2", AccessToken: "at", ExpiresAt: 9999999999},
+		),
+		Upstream:    upstream.New(),
+		APIKey:      "secret",
+		OnCheckin:   func() { checkin++ },
+		OnKeepalive: func() { keepalive++ },
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/admin/checkin", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || checkin != 1 {
+		t.Fatalf("checkin: code=%d called=%d body=%s", rec.Code, checkin, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "2 个账号") {
+		t.Errorf("checkin message should mention account count: %s", rec.Body)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/admin/keepalive", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || keepalive != 1 {
+		t.Fatalf("keepalive: code=%d called=%d", rec.Code, keepalive)
+	}
+}
+
+// TestAdminNotWired 未装配回调时返回 501（便于裁剪部署，且不假装成功）。
+func TestAdminNotWired(t *testing.T) {
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+	})
+	for _, ep := range []string{"/admin/checkin", "/admin/keepalive"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", ep, nil))
+		if rec.Code != http.StatusNotImplemented {
+			t.Errorf("%s: code=%d want 501", ep, rec.Code)
+		}
+	}
+}
+
+// TestAdminRevive 手动解冻：带 uid 解冻单个（不存在→404），空 body 解冻全部。
+func TestAdminRevive(t *testing.T) {
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at", ExpiresAt: 9999999999},
+	)
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
+	p.Cooldown("u2", pool.CoolSoft, time.Hour, "429")
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+
+	// 单个解冻
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/revive", strings.NewReader(`{"uid":"u1"}`)))
+	if rec.Code != 200 {
+		t.Fatalf("revive u1: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if st, _ := p.Status("u1"); st.Cooling {
+		t.Errorf("u1 应已解冻: %+v", st)
+	}
+	if st, _ := p.Status("u2"); !st.Cooling {
+		t.Errorf("u2 不应被动到: %+v", st)
+	}
+
+	// 不存在的 uid → 404
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/revive", strings.NewReader(`{"uid":"nope"}`)))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("revive unknown: code=%d want 404", rec.Code)
+	}
+
+	// 空 body → 全部解冻
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/revive", nil))
+	if rec.Code != 200 {
+		t.Fatalf("revive all: code=%d", rec.Code)
+	}
+	if st, _ := p.Status("u2"); st.Cooling {
+		t.Errorf("u2 应已解冻: %+v", st)
+	}
+}
+
+// TestReviveKeepsBreakerAndDisabled 解冻与熔断/禁用正交：只清冷却，不掩盖通道健康问题。
+func TestReviveKeepsBreakerAndDisabled(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.SetBreaker(1, time.Hour, time.Hour)
+	p.NoteError("u1") // 达到阈值 1 → 熔断
+	st, _ := p.Status("u1")
+	if !st.Cooling {
+		t.Fatalf("应已熔断: %+v", st)
+	}
+
+	p.Revive("u1")
+	st, _ = p.Status("u1")
+	if !st.Cooling {
+		t.Error("Revive 不得清掉熔断（熔断反映连续 5xx，需到期或成功才恢复）")
+	}
+
+	p.Disable("u1", "session dead")
+	p.Revive("u1")
+	if st, _ = p.Status("u1"); !st.Disabled {
+		t.Error("Revive 不得解除 disabled")
 	}
 }
