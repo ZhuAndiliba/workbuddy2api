@@ -3,6 +3,8 @@
   "api_key": "your-api-key-here",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "region": "",
+  "models_extra": [],
   "cooldown": {
     "soft_rate": "60s"
   },
