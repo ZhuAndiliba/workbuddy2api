@@ -36,16 +36,19 @@ type Store interface {
 }
 
 const (
-	bindPrefix  = "wb2api:bind:"
-	stateKey    = "wb2api:state"
 	readTimeout = 3 * time.Second
 )
 
-// New 根据 url+token 构建 Store。
-//   - url 为空 → Noop（纯内存模式）
-//   - url 已是完整 rediss:// URL 则直接 ParseURL；否则用 token 组装 rediss://default:token@host:6379
-//   - Ping 失败 → Noop + 启动警告（硬性降级要求：不因 Redis 不可用而失败）
+// New 根据 url+token 构建 Store（不限定区域，键名沿用旧前缀）。
+// 兼容旧调用；一区一实例的部署走 NewWithRegion 以避免两实例共用同一 key 互相覆盖。
 func New(url, token string) Store {
+	return NewWithRegion(url, token, "")
+}
+
+// NewWithRegion 同上，但把 Redis 键按区域加命名空间（wb2api:<region>:*）。
+// region 为空时保持旧键名（wb2api:*），保证既有部署升级后仍能读到自己写的快照。
+// 一区一实例时必须传 region：否则两个实例会互相覆盖 state 与粘性绑定。
+func NewWithRegion(url, token, region string) Store {
 	if url == "" {
 		log.Printf("[redisstore] upstash 未配置，进入纯内存模式（Noop 降级）")
 		return Noop{}
@@ -68,8 +71,24 @@ func New(url, token string) Store {
 		_ = client.Close()
 		return Noop{}
 	}
-	log.Printf("[redisstore] upstash 已连接 (addr=%s)", opt.Addr)
-	return &Upstash{client: client}
+	log.Printf("[redisstore] upstash 已连接 (addr=%s, region=%s)", opt.Addr, regionName(region))
+	return &Upstash{client: client, prefix: keyPrefixFor(region)}
+}
+
+// keyPrefixFor 返回该实例的键前缀；未限定区域时保持旧前缀（不加中段）。
+func keyPrefixFor(region string) string {
+	if region == "" {
+		return "wb2api:"
+	}
+	return "wb2api:" + region + ":"
+}
+
+// regionName 仅用于日志展示。
+func regionName(region string) string {
+	if region == "" {
+		return "both"
+	}
+	return region
 }
 
 // normalizeURL 把 url+token 归一化为可直接 ParseURL 的完整 rediss:// URL。
@@ -89,11 +108,14 @@ func normalizeURL(url, token string) string {
 }
 
 // Upstash 真实现：redis.Client 封装。
+// prefix 为该实例的键命名空间（"wb2api:" 或 "wb2api:<region>:"），
+// 使多个区域的实例共用同一 Redis 时互不覆盖。
 type Upstash struct {
 	client *redis.Client
+	prefix string
 }
 
-func bindKey(key string) string { return bindPrefix + key }
+func (u *Upstash) bindKey(key string) string { return u.prefix + "bind:" + key }
 
 // SetBind 异步镜像粘性会话绑定。
 func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
@@ -103,7 +125,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
+		if err := u.client.Set(ctx, u.bindKey(key), uid, ttl).Err(); err != nil {
 			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
 		}
 	}()
@@ -114,7 +136,7 @@ func (u *Upstash) DelBind(key string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
+		if err := u.client.Del(ctx, u.bindKey(key)).Err(); err != nil {
 			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
 		}
 	}()
@@ -125,7 +147,7 @@ func (u *Upstash) SaveState(data []byte) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {
+		if err := u.client.Set(ctx, u.prefix+"state", data, keyTTL).Err(); err != nil {
 			log.Printf("[redisstore] debug: SaveState: %v", err)
 		}
 	}()
@@ -135,18 +157,19 @@ func (u *Upstash) SaveState(data []byte) {
 func (u *Upstash) LoadState() ([]byte, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
-	v, err := u.client.Get(ctx, stateKey).Bytes()
+	v, err := u.client.Get(ctx, u.prefix+"state").Bytes()
 	if err != nil {
 		return nil, false
 	}
 	return v, true
 }
 
-// LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀）。
+// LoadBinds 全量读取本实例键前缀下的粘性会话绑定（SCAN <prefix>bind:*）。
 func (u *Upstash) LoadBinds() map[string]string {
 	out := map[string]string{}
 	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
+	bindPrefix := u.prefix + "bind:"
 	iter := u.client.Scan(ctx, 0, bindPrefix+"*", 200).Iterator()
 	for iter.Next(ctx) {
 		key := iter.Val()

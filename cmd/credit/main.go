@@ -10,8 +10,8 @@
 //	 "total":{"remain":N,"used":N,"size":N,"accounts":N,"ok":N,"failed":N},
 //	 "accounts":[{"uid","nickname","remain","used","size","packages","ok","error?"}]}
 //
-// 接口与聚合逻辑：POST codebuddy.cn/v2/billing/meter/get-user-resource，聚合所有 package 的
-// Cycle* 字段，TotalDosage 作 size 下限。
+// 接口与聚合逻辑：POST <billing host>/v2/billing/meter/get-user-resource，聚合所有 package 的
+// Cycle* 字段，TotalDosage 作 size 下限。billing host 按账号 domain 路由（CN / 国际站两套）。
 package main
 
 import (
@@ -23,9 +23,24 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"workbuddy2api/internal/auth"
 )
 
-const billingBaseCN = "https://www.codebuddy.cn"
+// billing host：CN 与国际站各自一套（与 internal/upstream 的 billingBase 口径一致）。
+const (
+	billingBaseCN     = "https://www.codebuddy.cn"
+	billingBaseGlobal = "https://www.workbuddy.ai"
+)
+
+// billingBaseFor 按账号 domain 选计费 host；空 domain / 未知域名回落 CN（向后兼容）。
+// 直接复用 internal/auth 的 region 判定，避免两处口径漂移。
+func billingBaseFor(domain string) string {
+	if (&auth.Auth{Domain: domain}).Region() == auth.RegionGlobal {
+		return billingBaseGlobal
+	}
+	return billingBaseCN
+}
 
 type authFile struct {
 	Auth struct {
@@ -98,13 +113,17 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
-	req, err := http.NewRequest(http.MethodPost, billingBaseCN+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, billingBaseFor(af.Auth.Domain)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+af.Auth.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+	// Origin/Referer 随区域变化：上游按来源校验，配错会被网关 401。
+	origin := billingBaseFor(af.Auth.Domain)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
 	if af.Account.UID != "" {
 		req.Header.Set("X-User-Id", af.Account.UID)
 	}

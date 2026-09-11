@@ -83,6 +83,43 @@ func TestLoadDirLoadsAllValid(t *testing.T) {
 	}
 }
 
+// TestFilterRegion 一区一实例：只保留指定区域的账号；空 region 原样返回。
+func TestFilterRegion(t *testing.T) {
+	cn1 := &Auth{UID: "cn1", Domain: "copilot.tencent.com"}
+	cn2 := &Auth{UID: "cn2", Domain: ""}
+	gl1 := &Auth{UID: "gl1", Domain: "www.workbuddy.ai"}
+	gl2 := &Auth{UID: "gl2", Domain: "codebuddy.ai"}
+	all := []*Auth{cn1, cn2, gl1, gl2}
+
+	got := FilterRegion(all, RegionCN)
+	if len(got) != 2 || got[0] != cn1 || got[1] != cn2 {
+		t.Errorf("cn filter: got %v", uids(got))
+	}
+	got = FilterRegion(all, RegionGlobal)
+	if len(got) != 2 || got[0] != gl1 || got[1] != gl2 {
+		t.Errorf("global filter: got %v", uids(got))
+	}
+	// 空 region = 不限定，必须原样返回（含 nil）。
+	if got := FilterRegion(all, ""); len(got) != 4 {
+		t.Errorf("empty region should keep all, got %v", uids(got))
+	}
+	if got := FilterRegion(nil, ""); got != nil {
+		t.Errorf("nil input with empty region should stay nil, got %v", got)
+	}
+	// 无匹配账户 → 空结果（不是 nil 崩溃）。
+	if got := FilterRegion([]*Auth{cn1}, RegionGlobal); len(got) != 0 {
+		t.Errorf("no match should yield empty, got %v", uids(got))
+	}
+}
+
+func uids(as []*Auth) []string {
+	out := make([]string, 0, len(as))
+	for _, a := range as {
+		out = append(out, a.UID)
+	}
+	return out
+}
+
 func TestNeedsRefresh(t *testing.T) {
 	a := &Auth{ExpiresAt: 0}
 	if !a.NeedsRefresh(0) {
@@ -91,5 +128,35 @@ func TestNeedsRefresh(t *testing.T) {
 	a.ExpiresAt = 9999999999
 	if a.NeedsRefresh(0) {
 		t.Error("far future should not need refresh")
+	}
+}
+
+// TestRegion 域名 → 区域判定：workbuddy.ai / codebuddy.ai 及其子域属国际站，
+// 空 domain 与 CN 域名归 CN（空 domain 是 CN 凭证的历史形态，必须向后兼容）。
+func TestRegion(t *testing.T) {
+	globals := []string{
+		"workbuddy.ai", "www.workbuddy.ai", "api.workbuddy.ai", "WorkBuddy.AI",
+		"codebuddy.ai", "www.codebuddy.ai", "  www.workbuddy.ai  ",
+	}
+	for _, d := range globals {
+		if got := (&Auth{Domain: d}).Region(); got != RegionGlobal {
+			t.Errorf("domain %q: got %s want global", d, got)
+		}
+	}
+	cns := []string{"", "copilot.tencent.com", "codebuddy.cn", "www.codebuddy.cn", "example.com"}
+	for _, d := range cns {
+		if got := (&Auth{Domain: d}).Region(); got != RegionCN {
+			t.Errorf("domain %q: got %s want cn", d, got)
+		}
+	}
+	// nil 接收者按 CN 处理，避免调用方到处判空。
+	if got := (*Auth)(nil).Region(); got != RegionCN {
+		t.Errorf("nil auth: got %s want cn", got)
+	}
+	// 不得把"恰好以 workbuddy.ai 结尾但不是其子域"的域名误判为国际站（如 evilworkbuddy.ai）。
+	for _, d := range []string{"evilworkbuddy.ai", "notworkbuddy.ai"} {
+		if got := (&Auth{Domain: d}).Region(); got != RegionCN {
+			t.Errorf("domain %q: got %s want cn (must not match bare suffix)", d, got)
+		}
 	}
 }

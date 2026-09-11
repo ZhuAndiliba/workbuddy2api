@@ -58,8 +58,32 @@ func TestNoopMethods(t *testing.T) {
 	}
 }
 
-func TestBindKeyPrefix(t *testing.T) {
-	if got := bindKey("abc"); got != bindPrefix+"abc" {
-		t.Errorf("bindKey=%q want prefix", got)
+// TestKeyPrefixFor 一区一实例时键必须按区域加命名空间，否则两个实例互相覆盖；
+// 未限定区域时保持旧前缀，保证既有部署升级后仍读得到自己写的快照。
+func TestKeyPrefixFor(t *testing.T) {
+	cases := map[string]string{
+		"":       "wb2api:",
+		"cn":     "wb2api:cn:",
+		"global": "wb2api:global:",
+	}
+	for region, want := range cases {
+		if got := keyPrefixFor(region); got != want {
+			t.Errorf("keyPrefixFor(%q)=%q want %q", region, got, want)
+		}
+	}
+	// 两个区域的键空间不得相交（旧前缀是 cn 前缀的前缀，但 bind 段不同）。
+	cn, gl := keyPrefixFor("cn")+"bind:", keyPrefixFor("global")+"bind:"
+	for _, k := range []string{"conv1", "conv2"} {
+		if cn+k == gl+k {
+			t.Errorf("cn/global key collision for %q", k)
+		}
+	}
+}
+
+// TestBindKeyUsesPrefix 实例的 bindKey 必须带上该实例前缀。
+func TestBindKeyUsesPrefix(t *testing.T) {
+	u := &Upstash{prefix: keyPrefixFor("global")}
+	if got := u.bindKey("abc"); got != "wb2api:global:bind:abc" {
+		t.Errorf("bindKey=%q want wb2api:global:bind:abc", got)
 	}
 }

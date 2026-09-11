@@ -47,6 +47,7 @@ func (k CoolKind) String() string {
 type Status struct {
 	UID             string    `json:"uid"`
 	Nickname        string    `json:"nickname,omitempty"`
+	Region          string    `json:"region,omitempty"`
 	Credits         int64     `json:"credits"`
 	Cooling         bool      `json:"cooling"`
 	CoolKind        string    `json:"cool_kind,omitempty"`
@@ -67,6 +68,7 @@ type Status struct {
 
 type entry struct {
 	a            *auth.Auth
+	region       string // 账号所属区域（auth.RegionCN / RegionGlobal），upsert 时从 domain 计算
 	credits      int64
 	successCount int64     // 累计成功
 	errTotal     int64     // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
@@ -87,6 +89,15 @@ type entry struct {
 
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+}
+
+// regionOf 返回账号区域。快照恢复出的 placeholder 凭证（仅 UID、无 domain）region 为空，
+// 此时按凭证现算（无 domain → CN），保证开机到 SyncToDir 之间的窗口内区域判定不为空。
+func (e *entry) regionOf() string {
+	if e.region != "" {
+		return e.region
+	}
+	return e.a.Region()
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
@@ -424,10 +435,28 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
 func (p *Pool) upsertLocked(a *auth.Auth) {
 	if e, ok := p.byUID[a.UID]; ok {
-		e.a = a // 保留 credits/cooling 状态
+		e.a = a               // 保留 credits/cooling 状态
+		e.region = a.Region() // 凭证可能换区（重新登录），region 跟随更新
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	p.byUID[a.UID] = &entry{a: a, region: a.Region()}
+}
+
+// Regions 返回池中当前存在的区域集合（按字典序，稳定输出）。
+// 供上层按区拉取模型列表 / 决定请求偏好区域；空池返回 nil。
+func (p *Pool) Regions() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	seen := map[string]bool{}
+	for _, e := range p.byUID {
+		seen[e.regionOf()] = true
+	}
+	out := make([]string, 0, len(seen))
+	for r := range seen {
+		out = append(out, r)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
@@ -439,7 +468,13 @@ func (p *Pool) Pick() *auth.Auth {
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried)
+	return p.pick(tried, "")
+}
+
+// PickExcludingInRegion 仅在指定区域（auth.RegionCN / RegionGlobal）内轮换选号。
+// 供按区拉取模型列表等"必须落在特定区域"的场景；region 为空等价于 PickExcluding。
+func (p *Pool) PickExcludingInRegion(region string, tried map[string]bool) *auth.Auth {
+	return p.pick(tried, region)
 }
 
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
@@ -448,7 +483,8 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
 // 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool) *auth.Auth {
+// region 非空时只在该区域内挑选，全冷却兜底同样受限（跨区兜底会把请求发到错误的 host）。
+func (p *Pool) pick(tried map[string]bool, region string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -456,6 +492,9 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
+			continue
+		}
+		if region != "" && e.regionOf() != region {
 			continue
 		}
 		if !e.healthy(now) {
@@ -469,7 +508,7 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now)
+		return p.pickEarliestExpiryLocked(tried, now, region)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
 	// 根本进不了短名单决策，低 credits 但高成功率/久置的账号会永远排不进 top5。
@@ -529,10 +568,14 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *auth.Auth {
+// region 非空时只在同区域内兜底，避免把国际站请求发到 CN host（反之亦然）。
+func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, region string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
+			continue
+		}
+		if region != "" && e.regionOf() != region {
 			continue
 		}
 		if e.disabled {
@@ -750,6 +793,42 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
 	}
 }
 
+// Revive 手动解冻：清掉即时冷却（until/coolKind/reason），不改 credits、不动熔断器
+// （fails/retryCount/breakerUntil），也不解除 disabled。返回该 uid 是否存在。
+//
+// 与 ReenableIfCredits 的区别：那个是"签到后余额恢复"的自动路径，要求 remain>0 并顺带更新
+// credits；本方法供运维手动触发（如刚充值完想立刻可用），只按操作者意图解冻、不臆测余额。
+// 与既有"签到解冻只清冷却不清熔断"语义一致：熔断反映连续 5xx 这类通道健康问题，
+// 不该被一次手动解冻掩盖。
+func (p *Pool) Revive(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	p.dirty.Store(true)
+	return true
+}
+
+// ReviveAll 对所有账号执行 Revive（清冷却），返回被处理的账号数。
+func (p *Pool) ReviveAll() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.byUID {
+		e.until = time.Time{}
+		e.coolKind = 0
+		e.reason = ""
+	}
+	if len(p.byUID) > 0 {
+		p.dirty.Store(true)
+	}
+	return len(p.byUID)
+}
+
 // NoteError 记录一次错误：喂入唯一的连续失败计数器 fails + 累计错误 errTotal。
 // 达到 breakerThreshold 触发熔断（指数退避），连续失败语义整体并入熔断器（不再有独立的 err 冷却）。
 func (p *Pool) NoteError(uid string) {
@@ -902,6 +981,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	st := Status{
 		UID:             uid,
 		Nickname:        e.a.Nickname,
+		Region:          e.regionOf(),
 		Credits:         e.credits,
 		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:          e.reason,

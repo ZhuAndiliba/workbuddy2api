@@ -1,5 +1,5 @@
 // Package auth 解析 WorkBuddy auth 文件（嵌套形/扁平形双形态），
-// 提供 refresh 后的原子写回。
+// 提供 region 判定与 refresh 后的原子写回。
 package auth
 
 import (
@@ -32,6 +32,55 @@ func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+// Region 取值为 auth.RegionCN / auth.RegionGlobal。
+const (
+	RegionCN     = "cn"
+	RegionGlobal = "global"
+)
+
+// 国际站（global）域名后缀：workbuddy.ai 与其子域（www./api. 等）同属国际站。
+// codebuddy.ai 与 workbuddy.ai 是同一套国际站部署（同一 Keycloak realm copilot、
+// 同一 /v2/plugin/* 端点族，实测两者可互相通过 Origin 校验），故一并识别。
+const (
+	globalSuffix    = ".workbuddy.ai"
+	globalSuffixAlt = ".codebuddy.ai"
+)
+
+// Region 返回账号所属区域（RegionCN / RegionGlobal），按凭证里的 domain 判定。
+// domain 为空视为 CN（向后兼容：CN 凭证历史上可能不写 domain）。
+// 接收者为 nil 时返回 CN，便于调用方免判空。
+func (a *Auth) Region() string {
+	if a == nil {
+		return RegionCN
+	}
+	d := strings.ToLower(strings.TrimSpace(a.Domain))
+	if d == "" {
+		return RegionCN
+	}
+	for _, suf := range []string{globalSuffix, globalSuffixAlt} {
+		if d == strings.TrimPrefix(suf, ".") || strings.HasSuffix(d, suf) {
+			return RegionGlobal
+		}
+	}
+	return RegionCN
+}
+
+// FilterRegion 只保留 region 匹配的账号；region 为空返回原切片（不限定区域）。
+// 供"一区一实例"部署用：把不属于本实例区域的凭证提前滤掉，
+// 使其既不进账号池、也不会被选号打往错误的上游 host。
+func FilterRegion(auths []*Auth, region string) []*Auth {
+	if region == "" {
+		return auths
+	}
+	out := make([]*Auth, 0, len(auths))
+	for _, a := range auths {
+		if a.Region() == region {
+			out = append(out, a)
+		}
+	}
+	return out
+}
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
 func (a *Auth) NeedsRefresh(within time.Duration) bool {

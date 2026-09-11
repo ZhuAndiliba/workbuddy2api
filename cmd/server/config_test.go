@@ -219,3 +219,67 @@ func TestBadSessionTTL(t *testing.T) {
 		t.Fatal("want error for bad session_sticky.ttl")
 	}
 }
+
+// TestRegionDefaultBoth 默认（不写 region）= 两区混编，向后兼容旧配置。
+func TestRegionDefaultBoth(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Region != "" {
+		t.Errorf("default region=%q want empty (both)", c.Region)
+	}
+}
+
+// TestRegionFromFile region=cn / global 均接受，且大小写与空白被归一。
+func TestRegionFromFile(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{`"cn"`, "cn"},
+		{`"global"`, "global"},
+		{`"  CN  "`, "cn"},
+		{`"Global"`, "global"},
+		{`""`, ""},
+	} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"region":`+tc.in+`}`), 0o600)
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("region=%s: %v", tc.in, err)
+		}
+		if c.Region != tc.want {
+			t.Errorf("region=%s: got %q want %q", tc.in, c.Region, tc.want)
+		}
+	}
+}
+
+// TestRegionFromEnv WB2A_REGION 覆盖文件值。
+func TestRegionFromEnv(t *testing.T) {
+	t.Setenv("WB2A_REGION", "global")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Region != "global" {
+		t.Errorf("region=%q want global from env", c.Region)
+	}
+}
+
+// TestRegionInvalid 非法值必须报错（防止写错一个字母就静默变成"两区混编"）。
+func TestRegionInvalid(t *testing.T) {
+	for _, bad := range []string{`"both"`, `"cnn"`, `"international"`, `"us"`} {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(`{"region":`+bad+`}`), 0o600)
+		if _, err := Load(fp); err == nil {
+			t.Errorf("region=%s: want error, got nil", bad)
+		}
+	}
+}
+
+func TestRegionInvalidEnv(t *testing.T) {
+	t.Setenv("WB2A_REGION", "bogus")
+	if _, err := Load(""); err == nil {
+		t.Fatal("want error for invalid WB2A_REGION")
+	}
+}

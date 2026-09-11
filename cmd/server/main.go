@@ -20,6 +20,14 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
+// regionLabel 仅用于日志展示：空 region 表示两区混编。
+func regionLabel(region string) string {
+	if region == "" {
+		return "both"
+	}
+	return region
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
@@ -40,10 +48,19 @@ func main() {
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+	// 一区一实例：region 非空时只保留该区账号，其余不进池（避免打往错误 host）。
+	if cfg.Region != "" {
+		total := len(auths)
+		auths = auth.FilterRegion(auths, cfg.Region)
+		log.Printf("region=%s: kept %d/%d account(s) from %s (skipped %d by region)",
+			cfg.Region, len(auths), total, cfg.AuthDir, total-len(auths))
+	} else {
+		log.Printf("loaded %d account(s) from %s (region=both)", len(auths), cfg.AuthDir)
+	}
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
-	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
+	// 按区域加键命名空间，使两区实例共用一个 Redis 时互不覆盖。
+	store := redisstore.NewWithRegion(cfg.Upstash.URL, cfg.Upstash.Token, cfg.Region)
 
 	p := pool.New(cfg.StateFile)
 	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
@@ -91,6 +108,11 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	// 上游模型清单不准，允许配置补充（见 config.go 的 ModelsExtra 注释）。
+	up.ModelsExtra = cfg.ModelsExtra
+	if len(cfg.ModelsExtra) > 0 {
+		log.Printf("models_extra: %d 个补充模型已注入 %v", len(cfg.ModelsExtra), cfg.ModelsExtra)
+	}
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
@@ -107,6 +129,11 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
+		Region:       cfg.Region,
+		// 手动触发定时任务（网页控制台用）：直接复用调度器的同一实现，
+		// 避免"手动签到"与"定时签到"两条路径行为漂移。
+		OnCheckin:   sch.RunCheckinNow,
+		OnKeepalive: sch.RunKeepaliveNow,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -126,7 +153,7 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
+	log.Printf("workbuddy2api listening on %s (api_key=%v, region=%s)", cfg.Listen, cfg.APIKey != "", regionLabel(cfg.Region))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}

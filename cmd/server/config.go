@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"workbuddy2api/internal/auth"
 )
 
 // Config 顶层配置。
@@ -16,6 +18,12 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// Region 限定本实例只服务某一区域的账号（"cn" / "global"）。
+	// 空 = 不限定，两区账号混编同池（向后兼容旧配置）。
+	// 权威依据是凭证的 domain（auth.Region()）；被滤掉的账号不会进池，
+	// 因此本实例只会向该区域的上游 host 发请求。
+	Region string `json:"region"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -28,6 +36,20 @@ type Config struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 	} `json:"schedule"`
+
+	// ModelsExtra 额外对外暴露的模型 ID（追加到上游动态列表之后，去重）。
+	//
+	// 为什么需要它：上游的模型清单本身不准确，实测两个方向都有偏差——
+	//   - 上游 catalog（/v3/config 的 data.models）会列出本区**不存在**的模型
+	//     （如国际站列出 gpt-5.1-codex / gemini-2.5-flash，调用返回 code=11102）；
+	//   - 而实际**可用**的模型又可能不在任何列表里（如国际站的 deepseek-v4.1-flash、
+	//     hy4-preview：/v3/config 全文搜索 0 次，但 chat 调用正常返回）。
+	// 官方客户端的模型白名单（agents 里 name=="cli" 的 models）同样既不充分也不完备。
+	//
+	// 因此：以官方白名单为默认来源，再给一个由使用者裁定的补充入口。
+	// 这里填的 ID 只影响 /v1/models 的展示与模型→区域亲和判断，不影响能否调用
+	// （/v1/chat/completions 对 model 字段本身不做白名单校验）。
+	ModelsExtra []string `json:"models_extra"`
 
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
@@ -131,6 +153,19 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
+	if v := os.Getenv("WB2A_REGION"); v != "" {
+		c.Region = v
+	}
+	// 逗号分隔的补充模型列表；空串不改动（与其他 env 的"非空才覆盖"语义一致）。
+	if v := os.Getenv("WB2A_MODELS_EXTRA"); v != "" {
+		var out []string
+		for _, s := range strings.Split(v, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		c.ModelsExtra = out
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -192,6 +227,13 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
+	}
+	// region：空 = 两区混编（默认，向后兼容）；非空必须是 cn / global。
+	// 不接受 "both" 之类的别名——空串已是"不限定"的表达，多一种写法只会引入歧义。
+	c.Region = strings.ToLower(strings.TrimSpace(c.Region))
+	if c.Region != "" && c.Region != auth.RegionCN && c.Region != auth.RegionGlobal {
+		return fmt.Errorf("region must be %q, %q or empty (both), got %q",
+			auth.RegionCN, auth.RegionGlobal, c.Region)
 	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen

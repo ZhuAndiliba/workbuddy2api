@@ -68,9 +68,37 @@ var hardMarkers = []string{
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
 }
 
+// softRateMarkers 限流/节流关键词（小写比较 + 中文原文比较双通道）。
+// 上游在状态码非 429 时也会返回限流语义，实测国际站以 HTTP 200 + code=14003
+// "too many requests" 返回；此类响应若不识别，账号既不被冷却也不喂熔断，
+// 下次请求仍会被选中，表现为"反复失败但不换号"。
+//
+// 词表按子串匹配，宁缺毋滥：只收录明确指向「请求速率/模型用量被节流」的措辞。
+// 连字符形式（rate-limiting / rate-limited）需单列——Contains 不跨 '-'。
+// "too many" 会命中 "too many tokens" 这类客户端参数错误，代价是该号被软冷却
+// 一个 SoftCooldown 后自愈，远小于漏判限流导致反复选中同一号的代价。
+var softRateMarkers = []string{
+	"rate limit", // rate limit / rate limits / rate limiting
+	"rate-limiting",
+	"rate-limited",
+	"too many requests",
+	"too many",
+	"usage limit", // usage limit reached / model usage limit exceeded（用量节流，非计费余额）
+	"请求过于频繁", "限流",
+}
+
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
+//
+// 判定顺序自「严」到「宽」，每层先后都有语义依据：
+//  1. 402 / hardMarkers —— 计费额度耗尽，最严、最不可自愈，必须最先判。
+//  2. sessionDeadMarkers —— 需人工重登的终态。若 401 body 同时含 12153 与限流文案，
+//     归 session_dead：短冷却救不活失效 session，误判为限流会让死号留在池中反复被选中；
+//     且此层 marker（12153 等）比限流层的大范围子串更具体，具体优先于宽泛。
+//  3. softRateMarkers —— 非 429 状态码携带限流文案（HTTP 200 + code=14003 等）。
+//  4. status==429 —— body 无文案时的兜底识别。
+//  5. 404 / 5xx / 其他 4xx —— 与限流无关的常规分类。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
@@ -86,6 +114,11 @@ func Classify(status int, body string) ErrKind {
 			return ErrSessionDead
 		}
 	}
+	for _, m := range softRateMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return ErrSoftRate
+		}
+	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
@@ -98,7 +131,7 @@ func Classify(status int, body string) ErrKind {
 	if status >= 400 {
 		return ErrClient
 	}
-	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
+	// HTTP 200 但业务 code 非 0 且含余额/限流关键词的情况已被上面两层捕获。
 	return ErrNone
 }
 
@@ -124,14 +157,22 @@ type Client struct {
 	IdleTimeout time.Duration
 
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
+	// 按区域分桶：同名模型在不同区域的受支持档位可能不同，混用会导致错误的降级结果。
 	effortsMu sync.RWMutex
-	efforts   map[string][]string
+	efforts   map[string]map[string][]string // region -> model -> supportedEfforts
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
-	ChatBaseCN    string
-	BillingBaseCN string
+	// ModelsExtra 额外对外暴露的模型 ID（追加到动态列表之后，去重）。
+	// 用途见 cmd/server/config.go 的 ModelsExtra 注释：上游清单本身不准，
+	// 需要给使用者一个补充入口。仅影响 /v1/models 的展示，不影响调用可行性。
+	ModelsExtra []string
+
+	ChatBaseCN      string
+	BillingBaseCN   string
+	ChatBaseGlobal  string
+	BillingBaseGlob string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -149,6 +190,10 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
+		// 国际站（domain 为 *.workbuddy.ai / *.codebuddy.ai 的账号）走同一套 host：
+		// 两者是同一后端部署（同 Keycloak realm、同 /v2/plugin/* 端点族，实测互认 Origin）。
+		ChatBaseGlobal:  "https://www.workbuddy.ai",
+		BillingBaseGlob: "https://www.workbuddy.ai",
 	}
 }
 
@@ -160,30 +205,42 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
+// chatBase 返回账号所属区域的上游 host；nil / 未知 region 一律回落 CN。
 func (c *Client) chatBase(a *auth.Auth) string {
+	if a.Region() == auth.RegionGlobal {
+		return c.ChatBaseGlobal
+	}
 	return c.ChatBaseCN
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
+// 按账号所属区域取 effort 能力表，避免跨区同名模型混用；
+// 国际站额外要求首条消息必须是 system（否则 code=11128），此处自动补齐。
+func (c *Client) prepareBody(a *auth.Auth, body []byte) []byte {
+	region := a.Region()
+	return PrepareBodyOptFull(body, c.SanitizeFingerprints, c.effortsSnapshot(region), region == auth.RegionGlobal)
 }
 
-// effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
-func (c *Client) effortsSnapshot() map[string][]string {
+// effortsSnapshot 返回指定区域 effort 能力缓存的副本；该区无缓存或为空时返回 nil（未知 → 透传不降级）。
+func (c *Client) effortsSnapshot(region string) map[string][]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	if len(c.efforts) == 0 {
+	byModel := c.efforts[region]
+	if len(byModel) == 0 {
 		return nil
 	}
-	cp := make(map[string][]string, len(c.efforts))
-	for k, v := range c.efforts {
+	cp := make(map[string][]string, len(byModel))
+	for k, v := range byModel {
 		cp[k] = v
 	}
 	return cp
 }
 
+// billingBase 返回账号所属区域的计费 host；nil / 未知 region 一律回落 CN。
 func (c *Client) billingBase(a *auth.Auth) string {
+	if a.Region() == auth.RegionGlobal {
+		return c.BillingBaseGlob
+	}
 	return c.BillingBaseCN
 }
 
@@ -259,7 +316,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(a, body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -297,10 +354,117 @@ type ModelInfo struct {
 }
 
 // FetchModels 调上游动态模型接口。
+// 主路径 /v3/config（官方客户端同款，CN 与国际站都可用，字段最全）；
+// 失败时回落旧路径 /console/enterprises/personal/models（仅 CN 可用，国际站返回 500）。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	url := c.chatBase(a) + "/console/enterprises/personal/models"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	out, err := c.fetchModelsAny(a)
+	if err != nil {
+		return nil, err
+	}
+	out = mergeModelsExtra(out, c.ModelsExtra)
+	c.cacheEfforts(a.Region(), out)
+	return out, nil
+}
+
+// mergeModelsExtra 把配置里补充的模型 ID 追加到动态列表之后（按 ID 去重，保持原顺序）。
+// 只补 ID 不带参数：这些模型不在上游清单里，拿不到 maxInputTokens 等元数据，
+// 主动留空由上层兜底，好过凭空编一个。
+func mergeModelsExtra(base []ModelInfo, extra []string) []ModelInfo {
+	if len(extra) == 0 {
+		return base
+	}
+	seen := make(map[string]bool, len(base)+len(extra))
+	for _, m := range base {
+		seen[m.ID] = true
+	}
+	out := base
+	for _, id := range extra {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, ModelInfo{ID: id})
+	}
+	return out
+}
+
+// fetchModelsAny 先试 /v3/config，失败回落旧 models 接口。
+func (c *Client) fetchModelsAny(a *auth.Auth) ([]ModelInfo, error) {
+	v3Out, v3Err := c.fetchModelsV3(a)
+	if v3Err == nil {
+		return v3Out, nil
+	}
+	// 保留旧路径作为兜底：/v3/config 若在某区被下线，仍能退化到旧接口。
+	if legacyOut, legacyErr := c.fetchModelsLegacy(a); legacyErr == nil {
+		return legacyOut, nil
+	}
+	return nil, v3Err
+}
+
+// cacheEfforts 刷新指定区域的 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
+// 空缓存也写入：表示"该区已拉取但无 effort 信息"，与"该区从未拉取"（无键 → 返回 nil）区分开。
+func (c *Client) cacheEfforts(region string, out []ModelInfo) {
+	cache := make(map[string][]string, len(out))
+	for _, mi := range out {
+		if len(mi.Efforts) > 0 {
+			cache[mi.ID] = mi.Efforts
+		}
+	}
+	c.effortsMu.Lock()
+	if c.efforts == nil {
+		c.efforts = map[string]map[string][]string{}
+	}
+	c.efforts[region] = cache
+	c.effortsMu.Unlock()
+}
+
+// modelsEnvelope /v3/config 与旧 models 接口共用的信封结构。
+// cliModels：从 agents 里取 name=="cli" 的 models 列表作为"对外可用模型"白名单。
+// 注意 /v3/config 无 disabled 字段，缺省即视为可用。
+type modelsEnvelope struct {
+	Code int `json:"code"`
+	Data struct {
+		Models []struct {
+			ID              string `json:"id"`
+			Name            string `json:"name"`
+			MaxInputTokens  int64  `json:"maxInputTokens"`
+			MaxOutputTokens int64  `json:"maxOutputTokens"`
+			Disabled        bool   `json:"disabled"`
+			Reasoning       struct {
+				Effort           string   `json:"effort"`
+				SupportedEfforts []string `json:"supportedEfforts"`
+			} `json:"reasoning"`
+		} `json:"models"`
+		Agents []struct {
+			Name   string   `json:"name"`
+			Models []string `json:"models"`
+		} `json:"agents"`
+	} `json:"data"`
+}
+
+// fetchModelsV3 走 /v3/config（官方客户端的数据源，两区通用）。
+func (c *Client) fetchModelsV3(a *auth.Auth) ([]ModelInfo, error) {
+	raw, err := c.getAuthed(a, "/v3/config")
+	if err != nil {
+		return nil, err
+	}
+	return parseModels(raw, "/v3/config")
+}
+
+// fetchModelsLegacy 走旧接口 /console/enterprises/personal/models（CN 可用）。
+func (c *Client) fetchModelsLegacy(a *auth.Auth) ([]ModelInfo, error) {
+	raw, err := c.getAuthed(a, "/console/enterprises/personal/models")
+	if err != nil {
+		return nil, err
+	}
+	return parseModels(raw, "models api")
+}
+
+// getAuthed 发一个带账号鉴权头的 GET，返回响应体（1 MiB 上限）。
+func (c *Client) getAuthed(a *auth.Auth, path string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -317,33 +481,20 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, fmt.Errorf("%s status %d: %s", path, resp.StatusCode, truncate(string(raw), 120))
 	}
-	var env struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []struct {
-				ID              string `json:"id"`
-				Name            string `json:"name"`
-				MaxInputTokens  int64  `json:"maxInputTokens"`
-				MaxOutputTokens int64  `json:"maxOutputTokens"`
-				Disabled        bool   `json:"disabled"`
-				Reasoning       struct {
-					Effort           string   `json:"effort"`
-					SupportedEfforts []string `json:"supportedEfforts"`
-				} `json:"reasoning"`
-			} `json:"models"`
-			Agents []struct {
-				Name   string   `json:"name"`
-				Models []string `json:"models"`
-			} `json:"agents"`
-		} `json:"data"`
-	}
+	return raw, nil
+}
+
+// parseModels 解析模型信封，并按 cli agent 的 models 白名单过滤。
+// src 仅用于错误信息（区分是哪个路径失败的）。
+func parseModels(raw []byte, src string) ([]ModelInfo, error) {
+	var env modelsEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
+		return nil, fmt.Errorf("%s parse: %w", src, err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("models api code=%d", env.Code)
+		return nil, fmt.Errorf("%s code=%d", src, env.Code)
 	}
 	var cliIDs []string
 	for _, ag := range env.Data.Agents {
@@ -353,25 +504,18 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 	}
 	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
+		return nil, fmt.Errorf("%s: no cli agent models found", src)
 	}
-	dynMap := make(map[string]struct {
-		ID              string
+	type modelRow struct {
 		Name            string
 		MaxInputTokens  int64
 		MaxOutputTokens int64
 		Disabled        bool
 		Efforts         []string
-	}, len(env.Data.Models))
+	}
+	dynMap := make(map[string]modelRow, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
-			ID              string
-			Name            string
-			MaxInputTokens  int64
-			MaxOutputTokens int64
-			Disabled        bool
-			Efforts         []string
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
+		dynMap[m.ID] = modelRow{m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
@@ -380,7 +524,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			continue
 		}
 		out = append(out, ModelInfo{
-			ID:            m.ID,
+			ID:            id,
 			Name:          m.Name,
 			ContextWindow: m.MaxInputTokens,
 			MaxTokens:     m.MaxOutputTokens,
@@ -388,18 +532,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		})
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+		return nil, fmt.Errorf("%s returned empty list", src)
 	}
-	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
-	cache := make(map[string][]string, len(out))
-	for _, mi := range out {
-		if len(mi.Efforts) > 0 {
-			cache[mi.ID] = mi.Efforts
-		}
-	}
-	c.effortsMu.Lock()
-	c.efforts = cache
-	c.effortsMu.Unlock()
 	return out, nil
 }
 

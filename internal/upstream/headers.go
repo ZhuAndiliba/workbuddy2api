@@ -9,11 +9,20 @@ import (
 )
 
 const (
-	clientUA        = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originRefererCN = "https://www.codebuddy.cn"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originRefererCN     = "https://www.codebuddy.cn"
+	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
+// originRefererFor 返回账号所属区域应携带的 Origin/Referer。
+// 与官方 CLI 行为一致：CN 凭证配 CN Origin、国际站凭证配国际站 Origin。
+// 注：实测上游当前并不校验 Origin（改错值甚至省略都仍返回 200），此处仅为行为对齐，
+// 不依赖它做任何安全或路由判定；区域路由的权威依据是 host 本身。
+// nil / 未知 region 回落 CN。
 func originRefererFor(a *auth.Auth) string {
+	if a.Region() == auth.RegionGlobal {
+		return originRefererGlobal
+	}
 	return originRefererCN
 }
 

@@ -72,6 +72,84 @@ func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	}
 }
 
+// TestRegionOfAccount 区域判定随凭证 domain 走；空 domain（CN 历史形态）归 CN。
+func TestRegionOfAccount(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1"})
+	p.Add(&auth.Auth{UID: "gl1", Domain: "www.workbuddy.ai"})
+	p.Add(&auth.Auth{UID: "gl2", Domain: "codebuddy.ai"})
+
+	cases := map[string]string{
+		"cn1": auth.RegionCN,
+		"gl1": auth.RegionGlobal,
+		"gl2": auth.RegionGlobal,
+	}
+	for uid, want := range cases {
+		st, ok := p.Status(uid)
+		if !ok || st.Region != want {
+			t.Errorf("uid=%s region=%q want %q (ok=%v)", uid, st.Region, want, ok)
+		}
+	}
+}
+
+// TestRegionsUnion Regions 返回池中实际存在的区域集合（稳定排序）。
+func TestRegionsUnion(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1"})
+	p.Add(&auth.Auth{UID: "gl1", Domain: "www.workbuddy.ai"})
+	got := p.Regions()
+	if len(got) != 2 || got[0] != auth.RegionCN || got[1] != auth.RegionGlobal {
+		t.Fatalf("Regions=%v want [cn global]", got)
+	}
+}
+
+// TestPickExcludingInRegion 区域受限选号：只在指定区域内挑，绝不跨区。
+func TestPickExcludingInRegion(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1"})
+	p.Add(&auth.Auth{UID: "gl1", Domain: "www.workbuddy.ai"})
+	p.SetCredits("cn1", 100)
+	p.SetCredits("gl1", 100)
+
+	for i := 0; i < 50; i++ {
+		if got := p.PickExcludingInRegion(auth.RegionGlobal, nil); got == nil || got.UID != "gl1" {
+			t.Fatalf("global pick=%+v want gl1", got)
+		}
+		if got := p.PickExcludingInRegion(auth.RegionCN, nil); got == nil || got.UID != "cn1" {
+			t.Fatalf("cn pick=%+v want cn1", got)
+		}
+	}
+	// 空 region 等价于不限制（全区轮换）。
+	if got := p.PickExcludingInRegion("", nil); got == nil {
+		t.Fatal("empty region should mean unrestricted")
+	}
+	// 池内不存在的区域返回 nil。
+	if got := p.PickExcludingInRegion("nonexistent", nil); got != nil {
+		t.Fatalf("unknown region pick=%+v want nil", got)
+	}
+}
+
+// TestPickRegionRestrictedFallback 区域受限时，全冷却兜底也必须留在同区，
+// 否则会把请求发到错误的 host（CN 号跑国际站 host 必被 401）。
+func TestPickRegionRestrictedFallback(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "cn1"})
+	p.Add(&auth.Auth{UID: "gl1", Domain: "www.workbuddy.ai"})
+	// 两个号都软冷却 → 无 healthy 候选，触发兜底路径。
+	p.Cooldown("cn1", CoolSoft, time.Hour, "429")
+	p.Cooldown("gl1", CoolSoft, time.Hour, "429")
+
+	got := p.PickExcludingInRegion(auth.RegionGlobal, nil)
+	if got == nil || got.UID != "gl1" {
+		t.Fatalf("region-restricted fallback=%+v want gl1 (must not cross region)", got)
+	}
+	got = p.PickExcludingInRegion(auth.RegionCN, nil)
+	if got == nil || got.UID != "cn1" {
+		t.Fatalf("region-restricted fallback=%+v want cn1 (must not cross region)", got)
+	}
+}
+
 func TestPickNilWhenAllDisabled(t *testing.T) {
 	// 全禁用 → 兜底不参与（禁用账号永不参与兜底）→ 返回 nil。
 	p := New("")
