@@ -1,20 +1,34 @@
 #!/usr/bin/env bash
-# setup.sh — 服务器组装三项目工作区：把胶水文件从 international/workspace 铺到父目录。
-# 前提：父目录下已有 upstream/ 与 international/ 两份克隆（见 workspace/README.md）。
+# setup.sh — 服务器组装一体化容器工作区：铺编排文件 + 建目录骨架。
+#
+# 前提：父目录下已有 upstream/ 与 international/ 两份克隆（见 README）。
+# 凭据与 config.json 不进 git，需要自己准备（见 README 的服务器部署一节）。
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"   # .../international/workspace
 ROOT="$(dirname "$HERE")"               # .../（父目录）
 
-cp "$HERE/cn.sh" "$HERE/growth.sh" "$HERE/README.md" "$ROOT/"
-cp "$HERE/docker-compose.yml" "$ROOT/"
-chmod +x "$ROOT/cn.sh" "$ROOT/growth.sh"
+cp "$HERE/Dockerfile" "$HERE/entrypoint.sh" "$HERE/docker-compose.yml" \
+   "$HERE/run.sh" "$HERE/README.md" "$ROOT/"
+chmod +x "$ROOT/run.sh" "$ROOT/entrypoint.sh"
 
-mkdir -p "$ROOT/console/data/run" "$ROOT/console/data/logs"
-cp "$HERE/console-run.sh" "$ROOT/console/run.sh"
-chmod +x "$ROOT/console/run.sh"
-if [[ ! -f "$ROOT/console/config.json" ]]; then
-    cp "$HERE/console.config.example.json" "$ROOT/console/config.json"
-    echo "已生成 console/config.json（按注释改 root 为服务器实际路径、填 token）"
-fi
+mkdir -p "$ROOT/console"
+cat > "$ROOT/console/config.json" <<'JSON'
+{
+  "console": {
+    "listen": "0.0.0.0:7860",
+    "token": "CHANGE-ME-强随机串（远程访问必填）",
+    "supervisor": true
+  },
+  "instances": {
+    "cn":     { "label": "CN",     "root": "../upstream" },
+    "global": { "label": "国际站", "root": "../international" }
+  }
+}
+JSON
 echo "工作区就位：$ROOT"
-echo "下一步：编辑 upstream/config.json、international/config.json、console/config.json（见 README）"
+echo "下一步："
+echo "  1. 改 console/config.json 的 token"
+echo "  2. 准备 upstream/config.json（CN，参考 config.example.json）"
+echo "  3. 准备 international/config.json（国际站，参考 config.example.json）"
+echo "  4. 放账号凭证：upstream/auths/ 与 international/auths/"
+echo "  5. ./run.sh up"

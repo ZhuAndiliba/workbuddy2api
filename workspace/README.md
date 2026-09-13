@@ -22,28 +22,22 @@ wb2api/
 ## 日常操作
 
 ```bash
-./cn.sh status                    # CN 容器状态 + healthz
-./cn.sh start | stop | restart | logs
-./cn.sh update                    # ★ CN 更新一条龙：git pull upstream + 重建镜像 + 重启容器
-./growth.sh ALL                   # 查活动参与：领猫/任务/体力（只读 dry-run）
-cd international && ./run.sh      # 国际站
-cd console && ./run.sh start      # 中控 → http://127.0.0.1:7860/?token=…
+./run.sh up        # 构建并启动（首次 1-2 分钟）；开机自启由 restart 策略兜底
+./run.sh restart   # ★ 日常更新：重新 git pull 两份仓库 + 编译 + 起服务
+./run.sh logs      # 三个服务日志（[cn] / [global] / [console] 前缀）
+./run.sh status    # 容器状态 + 三个端口健康
+./run.sh down      # 停止；./run.sh shell 进容器
+./growth.sh ALL    # 查 CN 活动参与：领猫/任务/体力（只读 dry-run）
 ```
 
-CN 是容器（`restart: unless-stopped`）：**开机/Docker 守护进程启动时自动拉起，
-进程崩溃自动重启**，无需人工干预。中控对国际站全功能（启停/日志/签到/解冻）；
-对 CN 可看状态/账号/模型（容器内进程不可由中控直接启停，且原版本就无 /admin 接口）。
+中控在 http://127.0.0.1:7860/?token=<console/config.json 里的 token>：
+看账号池/模型/日志，启停按钮走意图文件（data/run/<name>.want）交给容器守护进程执行。
 
 ## 更新上游代码（两条独立动线）
 
-**CN —— 一条命令（git pull 的 Docker 版）：**
-
-```bash
-./cn.sh update    # = git -C upstream pull + docker build + 容器替换重启，业务中断约 3 秒
-```
-
-镜像从 `upstream/` 拉下来的源码构建，所以"更新"就是先 git pull 再重建——
-上游的新功能（猫猫旅行、活跃上报、限流修复……）随 pull 即得。
+**CN —— 零操作**：容器每次启动都会 `git -C upstream pull`（我们从不改这个仓库，
+永远是快进），所以 `./run.sh restart` 一条命令就完成"拉最新 + 编译 + 起服务"。
+上游的新功能（猫猫旅行、活跃上报、限流修复……）随 restart 即得。
 
 **国际版 —— 定期合并**（要上游新功能时才做，有冲突要解）：
 

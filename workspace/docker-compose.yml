@@ -1,28 +1,39 @@
+# docker-compose.yml — wb2api 一体化容器：CN + 国际站 + 中控，一个容器全装。
+#
+#   docker compose up -d --build      # 构建并启动（首次约 1-2 分钟）
+#   docker compose logs -f            # 三个服务日志都带 [cn]/[global]/[console] 前缀
+#   docker compose restart            # 重启 = 重新 git pull + 编译 + 起服务
+#   docker compose down               # 停止并删除容器（挂载的数据不受影响）
+#
+# 每次启动都拉取两份仓库：CN 仓库我们从不改，pull 永远快进（无损）；
+# 国际版拉的是你合并后推上去的结果。
 services:
-  # CN 实例：镜像 wb2api-cn:local 由 ./cn.sh build 从 upstream/ 的 git 源码构建
-  # （更新 = ./cn.sh update ≙ git pull + 重建 + 重启）。
-  # 上游作者的 ghcr 镜像目前还没发布成功（denied）；等它公开后想换成"拉注册表镜像"，
-  # 把 image 行换成：
-  #   image: ghcr.io/sliverkiss/workbuddy2api:latest
-  #   pull_policy: always
-  cn:
-    image: wb2api-cn:local
-    container_name: wb2api-cn
-    restart: unless-stopped   # docker 守护进程启动（含开机）时自动拉起
+  wb2api:
+    build: .
+    image: wb2api-allinone:local
+    container_name: wb2api
+    restart: unless-stopped        # 开机 / Docker 守护进程启动时自动拉起
     ports:
-      - "7864:7864"
-    volumes:
-      # 配置只读；凭证与池状态可写（token 刷新/状态落盘都发生在容器里）
-      - ./upstream/config.json:/app/config.json:ro
-      - ./upstream/auths:/app/auths
-      - ./upstream/data:/app/data
+      - "7864:7864"                # CN
+      - "7865:7865"                # 国际站
+      - "7860:7860"                # 中控
     environment:
       - TZ=Asia/Shanghai
-    # 镜像内置 HEALTHCHECK 写死 7863；这里按实际端口覆盖
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7864/healthz || exit 1"]
-      interval: 30s
-      timeout: 5s
-      start_period: 15s
-    # Linux 服务器上首次部署：宿主机执行 chown -R 10001:10001 upstream/auths upstream/data
-    # （镜像以 app 用户 uid 10001 运行；OrbStack/macOS 会自动映射 uid，无需处理）
+      # 私有仓库拉取令牌（两个仓库都是公开的，一般不需要）
+      # - WB2A_GIT_TOKEN=ghp_xxx
+      # 调试开关：跳过拉取 / 跳过编译
+      # - WB2A_PULL=0
+      # - WB2A_SKIP_BUILD=1
+    volumes:
+      # 代码：宿主机的两份克隆直接挂进去（容器内 pull/编译，产物也落在宿主机）
+      - ./upstream:/work/upstream
+      - ./international:/work/international
+      # 中控：配置与运行数据在宿主机
+      - ./console:/work/console
+      # Go 构建缓存：容器重建后不必重新下载依赖（首次会填充）
+      - wb2api-gomod:/go/pkg/mod
+      - wb2api-gocache:/root/.cache/go-build
+
+volumes:
+  wb2api-gomod:
+  wb2api-gocache:
