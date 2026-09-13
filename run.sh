@@ -106,6 +106,15 @@ EOF
     fi
 }
 
+# port_busy 端口占用探测：优先 lsof；没有 lsof 的 Linux 退回 bash /dev/tcp。
+port_busy() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    else
+        (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+    fi
+}
+
 start() {
     local target="$1" daemon="$2"
     [[ -f "$CONFIG" ]] || { echo "缺少配置文件 $CONFIG" >&2; exit 1; }
@@ -129,7 +138,7 @@ start() {
         echo "[$target] 读不到监听端口（$CONFIG 里该实例缺 listen？）" >&2
         return 1
     fi
-    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    if port_busy "$port"; then
         echo "[$target] 端口 $port 已被占用，先停掉占用者再启动" >&2
         exit 1
     fi
@@ -312,7 +321,7 @@ if [[ "${1:-}" == "console" ]]; then
         mkdir -p "$RUN_DIR" "$LOG_DIR"
         console_build
         CONSOLE_PORT="$(console_port)"
-        if lsof -nP -iTCP:"$CONSOLE_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        if port_busy "$CONSOLE_PORT"; then
             echo "[console] 端口 $CONSOLE_PORT 已被占用" >&2; exit 1
         fi
         echo "==> 启动控制台 (:$CONSOLE_PORT)"
