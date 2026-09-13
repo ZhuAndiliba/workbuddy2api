@@ -5,7 +5,15 @@
 # 凭据与 config.json 不进 git，需要自己准备（见 README 的服务器部署一节）。
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"   # .../international/workspace
-ROOT="$(dirname "$HERE")"               # .../（父目录）
+INTL="$(dirname "$HERE")"               # .../international
+ROOT="$(dirname "$INTL")"               # .../ ← 工作区根（upstream 与 international 的父目录）
+
+# 布局校验：根目录下必须能看到两份克隆，否则说明有人把 workspace 挪了位置。
+if [ ! -d "$ROOT/upstream" ] || [ ! -d "$ROOT/international" ]; then
+    echo "错误：$ROOT 下没看到 upstream/ 与 international/ 两份克隆。" >&2
+    echo "      setup.sh 需要在 <工作区根>/international/workspace/ 下运行。" >&2
+    exit 1
+fi
 
 cp "$HERE/Dockerfile" "$HERE/entrypoint.sh" "$HERE/docker-compose.yml" \
    "$HERE/run.sh" "$HERE/README.md" "$HERE/growth.sh" "$ROOT/"
