@@ -8,8 +8,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"   # .../international/workspace
 ROOT="$(dirname "$HERE")"               # .../（父目录）
 
 cp "$HERE/Dockerfile" "$HERE/entrypoint.sh" "$HERE/docker-compose.yml" \
-   "$HERE/run.sh" "$HERE/README.md" "$ROOT/"
-chmod +x "$ROOT/run.sh" "$ROOT/entrypoint.sh"
+   "$HERE/run.sh" "$HERE/README.md" "$HERE/growth.sh" "$ROOT/"
+chmod +x "$ROOT/run.sh" "$ROOT/entrypoint.sh" "$ROOT/growth.sh"
 
 mkdir -p "$ROOT/console"
 cat > "$ROOT/console/config.json" <<'JSON'
