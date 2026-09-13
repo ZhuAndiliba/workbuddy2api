@@ -79,6 +79,11 @@ type consoleConfig struct {
 	Console struct {
 		Listen string `json:"listen"`
 		Token  string `json:"token"`
+		// Supervisor 容器监督模式：启停不直接操作进程，而是写意图文件
+		// data/run/<name>.want（up/down）交给容器里的监督进程执行。
+		// 必须这样分工：容器监督进程负责"崩了自动拉起"，若中控也直接杀/起，
+		// 两边会互相打架（中控刚停，监督进程立刻又拉起来）。
+		Supervisor bool `json:"supervisor"`
 	} `json:"console"`
 
 	Instances map[string]struct {
@@ -596,8 +601,27 @@ type Server struct {
 	token     string
 	mu        sync.Mutex // 串行化生命周期动作，避免连点造成并发启停
 
+	// supervisor=true 时不直接启停进程，改写成意图文件交给容器的监督进程。
+	// 见 consoleConfig.Console.Supervisor 的注释。
+	supervisor bool
+
 	modelsMu    sync.Mutex
 	modelsCache map[string]modelsEntry
+}
+
+// wantFile 意图文件路径：内容 "up"/"down" 表示希望该实例的运行状态。
+// 容器监督进程每轮读它决定是否拉起，因此中控与监督进程不会互相打架。
+func (in *instance) wantFile() string {
+	return filepath.Join(in.root, "data", "run", in.Name+".want")
+}
+
+// setWant 写意图文件（supervisor 模式下的"启停"）。
+func (in *instance) setWant(v string) error {
+	dir := filepath.Dir(in.wantFile())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(in.wantFile(), []byte(v+"\n"), 0o644)
 }
 
 type modelsEntry struct {
@@ -761,6 +785,36 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 监督模式：不直接动进程，写意图文件交给容器的监督进程执行。
+	// 这样"中控停掉的实例"不会被监督进程立刻又拉起来。
+	if s.supervisor {
+		var want, done string
+		switch req.Action {
+		case "start":
+			want, done = "up", in.Label+" 已请求启动（容器监督进程将在数秒内拉起）"
+		case "stop":
+			want, done = "down", in.Label+" 已请求停止（容器监督进程将在数秒内停止）"
+		case "restart":
+			want, done = "up", in.Label+" 已请求重启（容器监督进程将重启它）"
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok": false, "message": "action 只能是 start/stop/restart/checkin/keepalive/revive",
+			})
+			return
+		}
+		// restart 与 start 同义：监督进程的语义是"want=up 且没跑就拉起"，
+		// 它不需要区分用户点的是启动还是重启——效果都是让它跑起来。
+		if err := in.setWant(want); err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "message": err.Error()})
+			return
+		}
+		s.modelsMu.Lock()
+		delete(s.modelsCache, in.Name)
+		s.modelsMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": done})
+		return
+	}
+
 	var err error
 	done := ""
 	switch req.Action {
@@ -892,6 +946,20 @@ func isLoopbackHost(listen string) bool {
 	return strings.HasPrefix(host, "127.")
 }
 
+// readSupervisorFlag 读 config 的 console.supervisor（容器监督模式开关）。
+// 读不到/解析失败一律当 false：默认仍是"直接操作本机进程"的老行为。
+func readSupervisorFlag(path string) bool {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var c consoleConfig
+	if json.Unmarshal(raw, &c) != nil {
+		return false
+	}
+	return c.Console.Supervisor
+}
+
 func main() {
 	listen := flag.String("listen", "", "监听地址；留空则用 config 的 console.listen，再回落 127.0.0.1:7860")
 	token := flag.String("token", "", "控制令牌；留空则用 config 的 console.token。绑非回环地址时必须非空")
@@ -899,6 +967,7 @@ func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件（相对 root）")
 	instancesFlag := flag.String("instances", "", "受管实例，格式 name:Label[,name:Label]；留空则按 config 的 instances 分节推导")
 	printListen := flag.Bool("print-listen", false, "只打印解析后的监听地址后退出；供 run.sh 读端口")
+	supervisorFlag := flag.Bool("supervisor", false, "容器监督模式：启停写意图文件交给容器守护进程（等价于 config 的 console.supervisor）")
 	flag.Parse()
 
 	abs, err := filepath.Abs(*root)
@@ -960,10 +1029,18 @@ func main() {
 		log.Printf("已按 %s 推导受管实例", derived)
 	}
 
+	// 监督模式：启停改为写意图文件交给容器的监督进程（见 consoleConfig.Console.Supervisor）。
+	// 命令行 -supervisor 与 config 的 console.supervisor 任一为真即生效。
+	supervisor := *supervisorFlag || readSupervisorFlag(filepath.Join(abs, *cfgPath))
+	if supervisor {
+		log.Printf("容器监督模式：启停按钮写 data/run/<实例>.want，由容器监督进程执行")
+	}
+
 	s := &Server{
 		root:        abs,
 		instances:   insts,
 		token:       resolvedToken,
+		supervisor:  supervisor,
 		modelsCache: map[string]modelsEntry{},
 	}
 

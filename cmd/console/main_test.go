@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -376,5 +378,84 @@ func TestAdminNotFoundFriendlyMessage(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "原版") || !strings.Contains(err.Error(), "/admin") {
 		t.Errorf("error %q should explain the upstream binary limitation", err)
+	}
+}
+
+// TestSupervisorModeWritesWant 监督模式下 start/stop 不碰进程，只写意图文件。
+func TestSupervisorModeWritesWant(t *testing.T) {
+	dir := t.TempDir()
+	in := &instance{Name: "cn", Label: "CN", Config: "config.json", root: dir}
+	s := &Server{root: dir, instances: []*instance{in}, supervisor: true, modelsCache: map[string]modelsEntry{}}
+
+	call := func(action string) map[string]any {
+		body, _ := json.Marshal(map[string]string{"target": "cn", "action": action})
+		rec := httptest.NewRecorder()
+		s.handleAction(rec, httptest.NewRequest("POST", "/api/action", bytes.NewReader(body)))
+		var out map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+		}
+		return out
+	}
+
+	if out := call("stop"); out["ok"] != true {
+		t.Fatalf("stop: %v", out)
+	}
+	want := filepath.Join(dir, "data", "run", "cn.want")
+	raw, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatalf("意图文件未写出: %v", err)
+	}
+	if strings.TrimSpace(string(raw)) != "down" {
+		t.Errorf("want=down, got %q", raw)
+	}
+
+	if out := call("start"); out["ok"] != true {
+		t.Fatalf("start: %v", out)
+	}
+	raw, _ = os.ReadFile(want)
+	if strings.TrimSpace(string(raw)) != "up" {
+		t.Errorf("want=up, got %q", raw)
+	}
+
+	// 监督模式下不该留下 pid 文件（说明没直接操作进程）。
+	if _, err := os.Stat(filepath.Join(dir, "data", "run", "cn.pid")); err == nil {
+		t.Error("监督模式不应写 pid 文件")
+	}
+}
+
+// TestNonSupervisorModeUsesProcesses 非监督模式仍是老行为：不写意图文件。
+func TestNonSupervisorModeUsesProcesses(t *testing.T) {
+	dir := t.TempDir()
+	in := &instance{Name: "cn", Label: "CN", Config: "config.json", root: dir}
+	s := &Server{root: dir, instances: []*instance{in}, modelsCache: map[string]modelsEntry{}}
+	body, _ := json.Marshal(map[string]string{"target": "cn", "action": "stop"})
+	rec := httptest.NewRecorder()
+	s.handleAction(rec, httptest.NewRequest("POST", "/api/action", bytes.NewReader(body)))
+	if _, err := os.Stat(filepath.Join(dir, "data", "run", "cn.want")); err == nil {
+		t.Error("非监督模式不应写意图文件")
+	}
+}
+
+// TestReadSupervisorFlag 读 console.supervisor；缺省/坏配置一律 false。
+func TestReadSupervisorFlag(t *testing.T) {
+	dir := t.TempDir()
+	on := filepath.Join(dir, "on.json")
+	os.WriteFile(on, []byte(`{"console":{"supervisor":true}}`), 0o600)
+	if !readSupervisorFlag(on) {
+		t.Error("supervisor:true 应解析为 true")
+	}
+	off := filepath.Join(dir, "off.json")
+	os.WriteFile(off, []byte(`{"console":{"listen":"127.0.0.1:7860"}}`), 0o600)
+	if readSupervisorFlag(off) {
+		t.Error("未设置应为 false")
+	}
+	if readSupervisorFlag(filepath.Join(dir, "nope.json")) {
+		t.Error("缺文件应为 false")
+	}
+	bad := filepath.Join(dir, "bad.json")
+	os.WriteFile(bad, []byte(`{not json`), 0o600)
+	if readSupervisorFlag(bad) {
+		t.Error("坏配置应为 false")
 	}
 }
