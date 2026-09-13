@@ -1,0 +1,28 @@
+services:
+  # CN 实例：镜像 wb2api-cn:local 由 ./cn.sh build 从 upstream/ 的 git 源码构建
+  # （更新 = ./cn.sh update ≙ git pull + 重建 + 重启）。
+  # 上游作者的 ghcr 镜像目前还没发布成功（denied）；等它公开后想换成"拉注册表镜像"，
+  # 把 image 行换成：
+  #   image: ghcr.io/sliverkiss/workbuddy2api:latest
+  #   pull_policy: always
+  cn:
+    image: wb2api-cn:local
+    container_name: wb2api-cn
+    restart: unless-stopped   # docker 守护进程启动（含开机）时自动拉起
+    ports:
+      - "7864:7864"
+    volumes:
+      # 配置只读；凭证与池状态可写（token 刷新/状态落盘都发生在容器里）
+      - ./upstream/config.json:/app/config.json:ro
+      - ./upstream/auths:/app/auths
+      - ./upstream/data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+    # 镜像内置 HEALTHCHECK 写死 7863；这里按实际端口覆盖
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7864/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+    # Linux 服务器上首次部署：宿主机执行 chown -R 10001:10001 upstream/auths upstream/data
+    # （镜像以 app 用户 uid 10001 运行；OrbStack/macOS 会自动映射 uid，无需处理）

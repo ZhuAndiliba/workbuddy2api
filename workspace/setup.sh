@@ -6,6 +6,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"   # .../international/workspace
 ROOT="$(dirname "$HERE")"               # .../（父目录）
 
 cp "$HERE/cn.sh" "$HERE/growth.sh" "$HERE/README.md" "$ROOT/"
+cp "$HERE/docker-compose.yml" "$ROOT/"
 chmod +x "$ROOT/cn.sh" "$ROOT/growth.sh"
 
 mkdir -p "$ROOT/console/data/run" "$ROOT/console/data/logs"
