@@ -65,8 +65,13 @@ func (in *instance) logFile() string { return filepath.Join(in.root, "data", "lo
 
 // consoleConfig 控制台自己从 config 里读的字段。
 // 与 cmd/server 的 Config 同构（共享段 + instances 分节），但只取控制台要用的部分：
-// listen / api_key / console / instances。实例覆盖字段只需 listen 与 api_key——
-// 其余（region、state_file、pool…）是 server 的事。
+// listen / api_key / console / instances。
+//
+// instances 分节有两种身份：
+//   - 控制台管的就是"自己这棵目录树"里的实例（默认）：条目只需 listen/api_key 之外的
+//     展示信息，实例的端口/密钥从实例自己的 config 读；
+//   - 中控形态：实例分布在多个目录（如原版跑 CN、国际版跑国际站），此时条目用
+//     root 指向该实例的目录，label 给展示名。
 type consoleConfig struct {
 	Listen string `json:"listen"`
 	APIKey string `json:"api_key"`
@@ -79,6 +84,8 @@ type consoleConfig struct {
 	Instances map[string]struct {
 		Listen string `json:"listen"`
 		APIKey string `json:"api_key"`
+		Root   string `json:"root"`  // 实例所在目录；空 = 控制台自己的 root；相对路径相对控制台 root
+		Label  string `json:"label"` // 展示名；空 = labelOf(name)
 	} `json:"instances"`
 }
 
@@ -137,6 +144,51 @@ func instanceNames(path string) (names []string, ok bool) {
 		return nil, false
 	}
 	return sortedKeys(c.Instances), true
+}
+
+// configMulti 报告该实例的配置是否为多实例格式（含 instances 分节）。
+// 多实例格式的 server 才认识 -instance flag；原版二进制的单实例配置传了会直接报
+// "flag provided but not defined"，所以启动命令要按此决定是否追加 -instance。
+func (in *instance) configMulti() bool {
+	raw, err := os.ReadFile(in.configPath())
+	if err != nil {
+		return false
+	}
+	var c consoleConfig
+	if json.Unmarshal(raw, &c) != nil {
+		return false
+	}
+	return len(c.Instances) > 0
+}
+
+// deriveInstances 从中控 config 的 instances 分节构建受管实例：
+// 每个条目可带 root（实例所在目录，默认/相对路径都相对控制台自己的 root）与 label。
+// 读不出配置或分节为空时返回 nil，调用方走单实例/默认回退。
+func deriveInstances(cfgPath, consoleRoot string) []*instance {
+	names, ok := instanceNames(cfgPath)
+	if !ok || len(names) == 0 {
+		return nil
+	}
+	var c consoleConfig
+	if raw, err := os.ReadFile(cfgPath); err != nil || json.Unmarshal(raw, &c) != nil {
+		return nil
+	}
+	out := make([]*instance, 0, len(names))
+	for _, name := range names {
+		ov := c.Instances[name]
+		root := strings.TrimSpace(ov.Root)
+		if root == "" {
+			root = consoleRoot
+		} else if !filepath.IsAbs(root) {
+			root = filepath.Join(consoleRoot, root)
+		}
+		label := strings.TrimSpace(ov.Label)
+		if label == "" {
+			label = labelOf(name)
+		}
+		out = append(out, &instance{Name: name, Label: label, Config: "config.json", root: root})
+	}
+	return out
 }
 
 // labelOf 实例展示名：两个已知实例给中文名，其余用实例名本身。
@@ -276,6 +328,17 @@ func portBusy(port string) bool {
 	return true
 }
 
+// startArgs 构造启动命令行。bin = 实例目录下的 wb2api；
+// -instance 只对认识它的 server 二进制传（多实例配置格式）——原版二进制的单实例
+// 配置传了会 "flag provided but not defined" 直接退场，所以按配置格式决定。
+func (in *instance) startArgs() []string {
+	args := []string{filepath.Join(in.root, "wb2api"), "-config", in.Config}
+	if in.configMulti() {
+		args = append(args, "-instance", in.Name)
+	}
+	return args
+}
+
 // start 启动实例（后台子进程），日志追加到 data/logs/<name>.log。
 // 子进程与本控制台解耦：控制台退出不会带走实例。
 func (in *instance) start() error {
@@ -289,9 +352,9 @@ func (in *instance) start() error {
 	if portBusy(port) {
 		return fmt.Errorf("端口 %s 已被占用：可能由 run.sh 启动，请先停掉再试", port)
 	}
-	bin := filepath.Join(in.root, "wb2api")
-	if _, err := os.Stat(bin); err != nil {
-		return fmt.Errorf("找不到 %s（先编译：./run.sh build）", bin)
+	args := in.startArgs()
+	if _, err := os.Stat(args[0]); err != nil {
+		return fmt.Errorf("找不到 %s（先编译：./run.sh build）", args[0])
 	}
 	if _, err := in.readConfig(); err != nil {
 		return fmt.Errorf("读配置 %s 失败: %w", in.Config, err)
@@ -308,7 +371,7 @@ func (in *instance) start() error {
 	}
 	defer lf.Close()
 
-	cmd := exec.Command(bin, "-config", in.Config, "-instance", in.Name)
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = in.root
 	cmd.Stdout = lf
 	cmd.Stderr = lf
@@ -493,6 +556,12 @@ func (in *instance) admin(action string, body []byte) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
+	// 原版二进制没有 /admin/*（那是本 fork 加的运维接口）。翻成可操作的提示，
+	// 而不是甩一个含糊的 HTTP 404。
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("该实例是原版二进制（无 /admin 运维接口）：" +
+			"签到/保活/解冻由其内部调度器自动执行，中控只能启停与观测")
+	}
 	var out struct {
 		OK      bool   `json:"ok"`
 		Message string `json:"message"`
@@ -867,29 +936,26 @@ func main() {
 			"请在 config 的 console.token 里设置，或用 -token 传入。进程控制面不允许裸奔。", resolvedListen)
 	}
 
-	// 受管实例：命令行优先；留空则按 config 推导——多实例格式取 instances 分节全部实例，
-	// 单实例格式就管那一个（名字用 wb2api，与 run.sh 的 pid/日志命名一致）；
+	// 受管实例：命令行优先；留空则按 config 推导——多实例格式取 instances 分节全部
+	// 实例（中控场景下每个条目可带各自的 root/label），单实例格式就管那一个
+	// （名字用 wb2api，与 run.sh 的 pid/日志命名一致）；
 	// 只在配置完全读不出来时才回落到内置的 cn/global 两个默认名字。
-	spec := *instancesFlag
+	insts := deriveInstances(filepath.Join(abs, *cfgPath), abs)
 	derived := ""
-	if spec == "" {
-		names, ok := instanceNames(filepath.Join(abs, *cfgPath))
-		switch {
-		case len(names) > 0:
-			parts := make([]string, 0, len(names))
-			for _, n := range names {
-				parts = append(parts, n+":"+labelOf(n))
-			}
-			spec, derived = strings.Join(parts, ","), fmt.Sprintf("%s 的 instances 分节", *cfgPath)
-		case ok:
+	switch {
+	case insts != nil:
+		derived = fmt.Sprintf("%s 的 instances 分节", *cfgPath)
+	case *instancesFlag != "":
+		insts = parseInstances(*instancesFlag, abs, *cfgPath)
+	default:
+		if _, ok := instanceNames(filepath.Join(abs, *cfgPath)); ok {
 			// 单实例格式：一个实例，别再摆出两个指向同一进程的卡片。
-			spec, derived = "wb2api:默认实例", fmt.Sprintf("%s（单实例格式）", *cfgPath)
+			insts = parseInstances("wb2api:默认实例", abs, *cfgPath)
+			derived = fmt.Sprintf("%s（单实例格式）", *cfgPath)
+		} else {
+			insts = parseInstances("cn:CN,global:国际站", abs, *cfgPath)
 		}
 	}
-	if spec == "" {
-		spec = "cn:CN,global:国际站"
-	}
-	insts := parseInstances(spec, abs, *cfgPath)
 	if derived != "" {
 		log.Printf("已按 %s 推导受管实例", derived)
 	}

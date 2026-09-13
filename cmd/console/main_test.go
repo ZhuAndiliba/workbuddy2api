@@ -279,3 +279,102 @@ func TestLabelOf(t *testing.T) {
 		}
 	}
 }
+
+// TestDeriveInstances 中控 config 的 instances 分节可带各自 root/label：
+// 绝对路径原样用，相对路径相对控制台 root 解析，缺省回落控制台 root 与 labelOf。
+func TestDeriveInstances(t *testing.T) {
+	consoleRoot := t.TempDir()
+	other := t.TempDir()
+	cfg := filepath.Join(consoleRoot, "config.json")
+	os.WriteFile(cfg, []byte(`{
+		"console": {"listen": "127.0.0.1:7860", "token": "t"},
+		"instances": {
+			"global": {"root": "`+other+`", "label": "国际站"},
+			"cn":     {"root": "sub/dir"},
+			"solo":   {}
+		}
+	}`), 0o600)
+
+	insts := deriveInstances(cfg, consoleRoot)
+	if len(insts) != 3 {
+		t.Fatalf("instances=%d want 3", len(insts))
+	}
+	byName := map[string]*instance{}
+	for _, in := range insts {
+		byName[in.Name] = in
+	}
+	if got := byName["global"].root; got != other {
+		t.Errorf("global root=%q want %q (absolute)", got, other)
+	}
+	if byName["global"].Label != "国际站" {
+		t.Errorf("global label=%q", byName["global"].Label)
+	}
+	if got := byName["cn"].root; got != filepath.Join(consoleRoot, "sub/dir") {
+		t.Errorf("cn root=%q want relative resolved against console root", got)
+	}
+	if byName["cn"].Label != "CN" {
+		t.Errorf("cn label=%q want labelOf fallback", byName["cn"].Label)
+	}
+	if got := byName["solo"].root; got != consoleRoot {
+		t.Errorf("solo root=%q want console root fallback", got)
+	}
+	if byName["solo"].Label != "solo" {
+		t.Errorf("solo label=%q want name fallback", byName["solo"].Label)
+	}
+}
+
+// TestDeriveInstancesFallback 读不出配置 / 无 instances 分节 → 返回 nil（调用方走回退）。
+func TestDeriveInstancesFallback(t *testing.T) {
+	dir := t.TempDir()
+	if got := deriveInstances(filepath.Join(dir, "nope.json"), dir); got != nil {
+		t.Errorf("missing config: want nil, got %v", got)
+	}
+	cfg := filepath.Join(dir, "config.json")
+	os.WriteFile(cfg, []byte(`{"listen":":7863"}`), 0o600)
+	if got := deriveInstances(cfg, dir); got != nil {
+		t.Errorf("single-instance config: want nil, got %v", got)
+	}
+}
+
+// TestConfigMulti 多实例格式才追加 -instance；原版式单实例配置不能传（flag 不存在）。
+func TestConfigMulti(t *testing.T) {
+	dir := t.TempDir()
+	multi := &instance{Name: "cn", Config: "config.json", root: dir}
+	os.WriteFile(filepath.Join(dir, "config.json"),
+		[]byte(`{"listen":":7864","instances":{"cn":{"listen":":7864"}}}`), 0o600)
+	if !multi.configMulti() {
+		t.Error("multi-instance config should be multi")
+	}
+	args := multi.startArgs()
+	if len(args) != 5 || args[3] != "-instance" || args[4] != "cn" {
+		t.Errorf("startArgs=%v want -instance cn appended", args)
+	}
+
+	singleRoot := t.TempDir()
+	single := &instance{Name: "cn", Config: "config.json", root: singleRoot}
+	os.WriteFile(filepath.Join(singleRoot, "config.json"), []byte(`{"listen":":7864"}`), 0o600)
+	if single.configMulti() {
+		t.Error("single-instance config should not be multi")
+	}
+	sargs := single.startArgs()
+	if len(sargs) != 3 {
+		t.Errorf("startArgs=%v want no -instance (upstream binary lacks the flag)", sargs)
+	}
+}
+
+// TestAdminNotFoundFriendlyMessage 原版二进制无 /admin/*：404 要翻成人话。
+func TestAdminNotFoundFriendlyMessage(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	dir := t.TempDir()
+	port := strings.TrimPrefix(srv.URL, "http://127.0.0.1:")
+	os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"listen":"127.0.0.1:`+port+`"}`), 0o600)
+	in := &instance{Name: "cn", Label: "CN", Config: "config.json", root: dir}
+	_, err := in.admin("checkin", nil)
+	if err == nil {
+		t.Fatal("want error for 404")
+	}
+	if !strings.Contains(err.Error(), "原版") || !strings.Contains(err.Error(), "/admin") {
+		t.Errorf("error %q should explain the upstream binary limitation", err)
+	}
+}
